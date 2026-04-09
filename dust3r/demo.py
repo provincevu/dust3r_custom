@@ -65,7 +65,27 @@ def set_print_with_timestamp(time_format="%Y-%m-%d %H:%M:%S"):
 
 def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, cam_size=0.05,
                                  cam_color=None, as_pointcloud=False,
-                                 transparent_cams=False, silent=False):
+                                 transparent_cams=False, silent=False,
+                                 save_glb=True,
+                                 save_ply=True,
+                                 tsdf_fusion=False,
+                                 view_consistent_merge=False,
+                                 vcm_voxel_size=0.005,
+                                 remove_ground=False,
+                                 ground_y_preference="low",
+                                 ground_coplanar_angle_tol_deg=6.0,
+                                 ground_coplanar_offset_tol=-1.0,
+                                 remove_outlier_cc=False,
+                                 statistic_plane=False,
+                                 sp_normal_variance_threshold_deg=60.0,
+                                 sp_coplanarity_deg=75.0,
+                                 sp_outlier_ratio=0.75,
+                                 sp_min_num_points=100,
+                                 sp_normal_alignment_threshold=0.92,
+                                 sp_robust_sigma_k=2.5,
+                                 sp_flatten_distance_threshold=-1.0,
+                                 precomputed_points=None,
+                                 precomputed_colors=None):
     assert len(pts3d) == len(mask) <= len(imgs) <= len(cams2world) == len(focals)
     pts3d = to_numpy(pts3d)
     imgs = to_numpy(imgs)
@@ -74,10 +94,85 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
 
     scene = trimesh.Scene()
 
-    # full pointcloud
-    if as_pointcloud:
+    # full pointcloud (also used for PLY export)
+    if precomputed_points is not None:
+        pts = np.asarray(precomputed_points)
+        if precomputed_colors is not None:
+            col = np.asarray(precomputed_colors)
+        else:
+            col = np.zeros((len(pts), 3), dtype=np.float32)
+    else:
         pts = np.concatenate([p[m] for p, m in zip(pts3d, mask)])
         col = np.concatenate([p[m] for p, m in zip(imgs, mask)])
+
+    if as_pointcloud and view_consistent_merge:
+        from dust3r.utils.custom import view_consistent_merge as _view_consistent_merge
+
+        vcm_res = _view_consistent_merge(
+            pts.reshape(-1, 3),
+            col.reshape(-1, 3),
+            enabled=True,
+            voxel_size=float(vcm_voxel_size),
+        )
+        pts = vcm_res.points
+        col = vcm_res.colors if vcm_res.colors is not None else col
+
+    if remove_ground:
+        # Optional dependency: only used when enabled.
+        from dust3r.utils.custom import remove_ground as _remove_ground
+
+        coplanar_offset_tol = None if float(ground_coplanar_offset_tol) < 0 else float(ground_coplanar_offset_tol)
+        res = _remove_ground(
+            pts.reshape(-1, 3),
+            col.reshape(-1, 3),
+            enabled=True,
+            y_preference=str(ground_y_preference),
+            coplanar_angle_tol_deg=float(ground_coplanar_angle_tol_deg),
+            coplanar_offset_tol=coplanar_offset_tol,
+            strict=False,
+        )
+        pts = res.points
+        col = res.colors
+
+    if remove_outlier_cc:
+        # CloudCompare-like connected components filtering (keep largest cluster).
+        from dust3r.utils.custom import remove_outlier_cc as _remove_outlier_cc
+
+        res = _remove_outlier_cc(
+            pts.reshape(-1, 3),
+            col.reshape(-1, 3),
+            enabled=True,
+            octree_level=8,
+            min_points_per_component=20,
+            keep_largest_only=True,
+        )
+        pts = res.points
+        col = res.colors if res.colors is not None else col
+
+    # statistic_plane is temporarily hidden/disabled.
+    # To re-enable, uncomment the block below and restore UI controls/events.
+    # if statistic_plane:
+    #     # Optional dependency: only used when enabled.
+    #     from dust3r.utils.custom import statistic_plane as _statistic_plane
+    #
+    #     flatten_thr = None if float(sp_flatten_distance_threshold) <= 0 else float(sp_flatten_distance_threshold)
+    #     res = _statistic_plane(
+    #         pts.reshape(-1, 3),
+    #         col.reshape(-1, 3),
+    #         enabled=True,
+    #         normal_variance_threshold_deg=float(sp_normal_variance_threshold_deg),
+    #         coplanarity_deg=float(sp_coplanarity_deg),
+    #         outlier_ratio=float(sp_outlier_ratio),
+    #         min_num_points=int(sp_min_num_points),
+    #         normal_alignment_threshold=float(sp_normal_alignment_threshold),
+    #         robust_sigma_k=float(sp_robust_sigma_k),
+    #         flatten_distance_threshold=flatten_thr,
+    #         strict=False,
+    #     )
+    #     pts = res.points
+    #     col = res.colors if res.colors is not None else col
+
+    if as_pointcloud:
         pct = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
         scene.add_geometry(pct)
     else:
@@ -100,15 +195,43 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
     rot = np.eye(4)
     rot[:3, :3] = Rotation.from_euler('y', np.deg2rad(180)).as_matrix()
     scene.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
-    outfile = os.path.join(outdir, 'scene.glb')
+    # Always keep a GLB preview for the 3D widget.
+    preview_glb = os.path.join(outdir, 'scene.glb')
+    dl_glb = os.path.join(outdir, 'scene_download.glb') if bool(save_glb) else None
+    dl_ply = os.path.join(outdir, 'scene_download.ply') if bool(save_ply) else None
     if not silent:
-        print('(exporting 3D scene to', outfile, ')')
-    scene.export(file_obj=outfile)
-    return outfile
+        print('(exporting 3D preview to', preview_glb, ')')
+    scene.export(file_obj=preview_glb)
+
+    if dl_glb is not None:
+        scene.export(file_obj=dl_glb)
+    if dl_ply is not None:
+        pct = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
+        pct.export(file_obj=dl_ply)
+
+    return preview_glb, dl_glb, dl_ply
 
 
 def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud=False, mask_sky=False,
-                            clean_depth=False, transparent_cams=False, cam_size=0.05):
+                            clean_depth=False, transparent_cams=False, cam_size=0.05,
+                            save_glb=True,
+                            save_ply=True,
+                            tsdf_fusion=False,
+                            view_consistent_merge=False,
+                            vcm_voxel_size=0.005,
+                            remove_ground=False,
+                            ground_y_preference="low",
+                            ground_coplanar_angle_tol_deg=6.0,
+                            ground_coplanar_offset_tol=-1.0,
+                            remove_outlier_cc=False,
+                            statistic_plane=False,
+                            sp_normal_variance_threshold_deg=60.0,
+                            sp_coplanarity_deg=75.0,
+                            sp_outlier_ratio=0.75,
+                            sp_min_num_points=100,
+                            sp_normal_alignment_threshold=0.92,
+                            sp_robust_sigma_k=2.5,
+                            sp_flatten_distance_threshold=-1.0):
     """
     extract 3D_model (glb file) from a reconstructed scene
     """
@@ -125,15 +248,68 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
     focals = scene.get_focals().cpu()
     cams2world = scene.get_im_poses().cpu()
     # 3D pointcloud from depthmap, poses and intrinsics
+    depths = to_numpy(scene.get_depthmaps())
     pts3d = to_numpy(scene.get_pts3d())
     scene.min_conf_thr = float(scene.conf_trf(torch.tensor(min_conf_thr)))
     msk = to_numpy(scene.get_masks())
+
+    pre_pts = None
+    pre_col = None
+    if as_pointcloud and tsdf_fusion:
+        from dust3r.utils.custom import tsdf_fuse_views as _tsdf_fuse_views
+
+        tsdf_res = _tsdf_fuse_views(
+            depths,
+            cams2world,
+            focals,
+            masks=msk,
+            images=rgbimg,
+            enabled=True,
+            strict=False,
+        )
+        if len(tsdf_res.points) > 0:
+            pre_pts = tsdf_res.points
+            pre_col = tsdf_res.colors
+
     return _convert_scene_output_to_glb(outdir, rgbimg, pts3d, msk, focals, cams2world, as_pointcloud=as_pointcloud,
-                                        transparent_cams=transparent_cams, cam_size=cam_size, silent=silent)
+                                        transparent_cams=transparent_cams, cam_size=cam_size, silent=silent,
+                                        save_glb=save_glb,
+                                        save_ply=save_ply,
+                                        tsdf_fusion=tsdf_fusion,
+                                        view_consistent_merge=view_consistent_merge,
+                                        vcm_voxel_size=vcm_voxel_size,
+                                        remove_ground=remove_ground,
+                                        ground_y_preference=ground_y_preference,
+                                        ground_coplanar_angle_tol_deg=ground_coplanar_angle_tol_deg,
+                                        ground_coplanar_offset_tol=ground_coplanar_offset_tol,
+                                        remove_outlier_cc=remove_outlier_cc,
+                                        statistic_plane=statistic_plane,
+                                        sp_normal_variance_threshold_deg=sp_normal_variance_threshold_deg,
+                                        sp_coplanarity_deg=sp_coplanarity_deg,
+                                        sp_outlier_ratio=sp_outlier_ratio,
+                                        sp_min_num_points=sp_min_num_points,
+                                        sp_normal_alignment_threshold=sp_normal_alignment_threshold,
+                                        sp_robust_sigma_k=sp_robust_sigma_k,
+                                        sp_flatten_distance_threshold=sp_flatten_distance_threshold,
+                                        precomputed_points=pre_pts,
+                                        precomputed_colors=pre_col)
+
+
+def get_3D_model_and_downloads(*args, **kwargs):
+    preview_glb, dl_glb, dl_ply = get_3D_model_from_scene(*args, **kwargs)
+    return preview_glb, dl_glb, dl_ply
 
 
 def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
-                            as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
+                            as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size, save_glb, save_ply,
+                            tsdf_fusion,
+                            view_consistent_merge,
+                            vcm_voxel_size,
+                            remove_ground,
+                            ground_y_preference,
+                            ground_coplanar_angle_tol_deg,
+                            ground_coplanar_offset_tol,
+                            remove_outlier_cc,
                             scenegraph_type, winsize, refid):
     """
     from a list of images, run dust3r inference, global aligner.
@@ -162,8 +338,18 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
     if mode == GlobalAlignerMode.PointCloudOptimizer:
         loss = scene.compute_global_alignment(init='mst', niter=niter, schedule=schedule, lr=lr)
 
-    outfile = get_3D_model_from_scene(outdir, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
-                                      clean_depth, transparent_cams, cam_size)
+    outfile, glbfile, plyfile = get_3D_model_from_scene(outdir, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
+                                                        clean_depth, transparent_cams, cam_size,
+                                                        save_glb=save_glb,
+                                                        save_ply=save_ply,
+                                                        tsdf_fusion=tsdf_fusion,
+                                                        view_consistent_merge=view_consistent_merge,
+                                                        vcm_voxel_size=vcm_voxel_size,
+                                                        remove_ground=remove_ground,
+                                                        ground_y_preference=ground_y_preference,
+                                                        ground_coplanar_angle_tol_deg=ground_coplanar_angle_tol_deg,
+                                                        ground_coplanar_offset_tol=ground_coplanar_offset_tol,
+                                                        remove_outlier_cc=remove_outlier_cc)
 
     # also return rgb, depth and confidence imgs
     # depth is normalized with the max value for all images
@@ -183,7 +369,7 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
         imgs.append(rgb(depths[i]))
         imgs.append(rgb(confs[i]))
 
-    return scene, outfile, imgs
+    return scene, outfile, imgs, glbfile, plyfile
 
 
 def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
@@ -209,7 +395,7 @@ def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
 
 def main_demo(tmpdirname, model, device, image_size, server_name, server_port, silent=False):
     recon_fun = functools.partial(get_reconstructed_scene, tmpdirname, model, device, silent, image_size)
-    model_from_scene_fun = functools.partial(get_3D_model_from_scene, tmpdirname, silent)
+    model_from_scene_fun = functools.partial(get_3D_model_and_downloads, tmpdirname, silent)
     with gradio.Blocks(css=""".gradio-container {margin: 0 !important; min-width: 100%};""", title="DUSt3R Demo") as demo:
         # scene state is save so that you can change conf_thr, cam_size... without rerunning the inference
         scene = gradio.State(None)
@@ -239,14 +425,77 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                 # adjust the camera size in the output pointcloud
                 cam_size = gradio.Slider(label="cam_size", value=0.05, minimum=0.001, maximum=0.1, step=0.001)
             with gradio.Row():
+                save_glb = gradio.Checkbox(value=True, label="Enable GLB download")
+                save_ply = gradio.Checkbox(value=True, label="Enable PLY download")
+                tsdf_fusion = gradio.Checkbox(value=False, label="TSDF fusion (view-based)")
+                view_consistent_merge = gradio.Checkbox(value=False, label="View-consistent merge (1 layer)")
+            with gradio.Row():
+                vcm_voxel_size = gradio.Number(label="vcm_voxel_size", value=0.005, precision=6)
+            with gradio.Row():
                 as_pointcloud = gradio.Checkbox(value=False, label="As pointcloud")
                 # two post process implemented
                 mask_sky = gradio.Checkbox(value=False, label="Mask sky")
                 clean_depth = gradio.Checkbox(value=True, label="Clean-up depthmaps")
                 transparent_cams = gradio.Checkbox(value=False, label="Transparent cameras")
+                remove_ground = gradio.Checkbox(value=False, label="Remove ground (pointcloud)")
+                remove_outlier_cc = gradio.Checkbox(value=False, label="Remove outlier CC (keep largest)")
+            with gradio.Row():
+                ground_y_preference = gradio.Dropdown(
+                    ["low", "high"],
+                    value="low",
+                    label="ground_y_preference",
+                    info="low: ưu tiên mặt phẳng thấp theo trục Y, high: ưu tiên mặt phẳng cao",
+                )
+                ground_coplanar_angle_tol_deg = gradio.Slider(
+                    label="ground_coplanar_angle_tol_deg", value=6.0, minimum=1.0, maximum=20.0, step=0.5
+                )
+                ground_coplanar_offset_tol = gradio.Number(
+                    label="ground_coplanar_offset_tol (-1 = auto)", value=-1.0, precision=6
+                )
+            with gradio.Row():
+                # statistic_plane controls are temporarily hidden.
+                # Uncomment the blocks below to re-enable.
+                # statistic_plane = gradio.Checkbox(value=False, label="Statistic plane (flatten surfaces)")
+                pass
+            # with gradio.Row():
+            #     sp_normal_variance_threshold_deg = gradio.Slider(
+            #         label="sp_normal_variance_threshold_deg", value=60.0, minimum=5.0, maximum=90.0, step=1.0
+            #     )
+            #     sp_coplanarity_deg = gradio.Slider(
+            #         label="sp_coplanarity_deg", value=75.0, minimum=5.0, maximum=90.0, step=1.0
+            #     )
+            #     sp_outlier_ratio = gradio.Slider(
+            #         label="sp_outlier_ratio", value=0.75, minimum=0.0, maximum=1.0, step=0.01
+            #     )
+            # with gradio.Row():
+            #     sp_min_num_points = gradio.Number(
+            #         label="sp_min_num_points", value=100, precision=0, minimum=10, maximum=100000
+            #     )
+            #     sp_normal_alignment_threshold = gradio.Slider(
+            #         label="sp_normal_alignment_threshold", value=0.92, minimum=0.5, maximum=0.999, step=0.001
+            #     )
+            #     sp_robust_sigma_k = gradio.Slider(
+            #         label="sp_robust_sigma_k", value=2.5, minimum=0.5, maximum=6.0, step=0.1
+            #     )
+            #     sp_flatten_distance_threshold = gradio.Number(
+            #         label="sp_flatten_distance_threshold (-1 = auto)", value=-1.0, precision=6
+            #     )
+
+            export_inputs = [
+                scene, min_conf_thr, as_pointcloud, mask_sky,
+                clean_depth, transparent_cams, cam_size, save_glb, save_ply, tsdf_fusion,
+                view_consistent_merge, vcm_voxel_size,
+                remove_ground,
+                ground_y_preference,
+                ground_coplanar_angle_tol_deg,
+                ground_coplanar_offset_tol,
+                remove_outlier_cc,
+            ]
 
             outmodel = gradio.Model3D()
             outgallery = gradio.Gallery(label='rgb,depth,confidence', columns=3, height="100%")
+            out_glb_file = gradio.File(label="Download scene.glb")
+            out_ply_file = gradio.File(label="Download scene.ply")
 
             # events
             scenegraph_type.change(set_scenegraph_options,
@@ -256,32 +505,73 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                               inputs=[inputfiles, winsize, refid, scenegraph_type],
                               outputs=[winsize, refid])
             run_btn.click(fn=recon_fun,
-                          inputs=[inputfiles, schedule, niter, min_conf_thr, as_pointcloud,
-                                  mask_sky, clean_depth, transparent_cams, cam_size,
+                      inputs=[inputfiles, schedule, niter, min_conf_thr, as_pointcloud,
+                          mask_sky, clean_depth, transparent_cams, cam_size, save_glb, save_ply, tsdf_fusion,
+                          view_consistent_merge, vcm_voxel_size,
+                          remove_ground,
+                          ground_y_preference,
+                          ground_coplanar_angle_tol_deg,
+                          ground_coplanar_offset_tol,
+                          remove_outlier_cc,
                                   scenegraph_type, winsize, refid],
-                          outputs=[scene, outmodel, outgallery])
+                          outputs=[scene, outmodel, outgallery, out_glb_file, out_ply_file])
             min_conf_thr.release(fn=model_from_scene_fun,
-                                 inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                         clean_depth, transparent_cams, cam_size],
-                                 outputs=outmodel)
+                         inputs=export_inputs,
+                                 outputs=[outmodel, out_glb_file, out_ply_file])
             cam_size.change(fn=model_from_scene_fun,
-                            inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                    clean_depth, transparent_cams, cam_size],
-                            outputs=outmodel)
+                        inputs=export_inputs,
+                            outputs=[outmodel, out_glb_file, out_ply_file])
+            save_glb.change(fn=model_from_scene_fun,
+                            inputs=export_inputs,
+                            outputs=[outmodel, out_glb_file, out_ply_file])
+            save_ply.change(fn=model_from_scene_fun,
+                            inputs=export_inputs,
+                            outputs=[outmodel, out_glb_file, out_ply_file])
+            tsdf_fusion.change(fn=model_from_scene_fun,
+                               inputs=export_inputs,
+                               outputs=[outmodel, out_glb_file, out_ply_file])
+            view_consistent_merge.change(fn=model_from_scene_fun,
+                                         inputs=export_inputs,
+                                         outputs=[outmodel, out_glb_file, out_ply_file])
+            vcm_voxel_size.change(fn=model_from_scene_fun,
+                                  inputs=export_inputs,
+                                  outputs=[outmodel, out_glb_file, out_ply_file])
             as_pointcloud.change(fn=model_from_scene_fun,
-                                 inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                         clean_depth, transparent_cams, cam_size],
-                                 outputs=outmodel)
+                         inputs=export_inputs,
+                                 outputs=[outmodel, out_glb_file, out_ply_file])
             mask_sky.change(fn=model_from_scene_fun,
-                            inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                    clean_depth, transparent_cams, cam_size],
-                            outputs=outmodel)
+                        inputs=export_inputs,
+                            outputs=[outmodel, out_glb_file, out_ply_file])
             clean_depth.change(fn=model_from_scene_fun,
-                               inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                       clean_depth, transparent_cams, cam_size],
-                               outputs=outmodel)
+                           inputs=export_inputs,
+                               outputs=[outmodel, out_glb_file, out_ply_file])
             transparent_cams.change(model_from_scene_fun,
-                                    inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
-                                            clean_depth, transparent_cams, cam_size],
-                                    outputs=outmodel)
+                            inputs=export_inputs,
+                                    outputs=[outmodel, out_glb_file, out_ply_file])
+            remove_ground.change(fn=model_from_scene_fun,
+                                inputs=export_inputs,
+                                outputs=[outmodel, out_glb_file, out_ply_file])
+            ground_y_preference.change(fn=model_from_scene_fun,
+                                       inputs=export_inputs,
+                                       outputs=[outmodel, out_glb_file, out_ply_file])
+            ground_coplanar_angle_tol_deg.release(fn=model_from_scene_fun,
+                                                  inputs=export_inputs,
+                                                  outputs=[outmodel, out_glb_file, out_ply_file])
+            ground_coplanar_offset_tol.change(fn=model_from_scene_fun,
+                                              inputs=export_inputs,
+                                              outputs=[outmodel, out_glb_file, out_ply_file])
+            remove_outlier_cc.change(fn=model_from_scene_fun,
+                                     inputs=export_inputs,
+                                     outputs=[outmodel, out_glb_file, out_ply_file])
+            # statistic_plane events are temporarily hidden.
+            # statistic_plane.change(fn=model_from_scene_fun,
+            #                     inputs=export_inputs,
+            #                     outputs=outmodel)
+            # sp_normal_variance_threshold_deg.release(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
+            # sp_coplanarity_deg.release(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
+            # sp_outlier_ratio.release(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
+            # sp_min_num_points.change(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
+            # sp_normal_alignment_threshold.release(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
+            # sp_robust_sigma_k.release(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
+            # sp_flatten_distance_threshold.change(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
     demo.launch(share=False, server_name=server_name, server_port=server_port)
