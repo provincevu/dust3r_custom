@@ -98,6 +98,8 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
 
     scene = trimesh.Scene()
     slab_cut_lines = None
+    facade_pts = None
+    facade_col = None
 
     # full pointcloud (also used for PLY export)
     if precomputed_points is not None:
@@ -143,6 +145,7 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
             pts.reshape(-1, 3),
             col.reshape(-1, 3),
             enabled=True,
+            regenerate_ground=False,
             align_ground_to_oxz=bool(align_ground_to_oxz_export),
             y_preference=str(ground_y_preference),
             coplanar_angle_tol_deg=float(ground_coplanar_angle_tol_deg),
@@ -180,6 +183,14 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
         )
         # Keep cloud unchanged; wall slab is used to compute/visualize cut range only.
         slab_cut_lines = slab_res.cut_lines
+        if len(slab_res.facade_band_points) > 0:
+            facade_pts = slab_res.facade_band_points
+            if slab_res.colors is not None:
+                if slab_res.source_mask.shape[0] == slab_res.colors.shape[0]:
+                    src_cols = slab_res.colors[slab_res.source_mask]
+                else:
+                    src_cols = slab_res.colors
+                facade_col = src_cols[slab_res.facade_band_mask]
 
     # statistic_plane is temporarily hidden/disabled.
     # To re-enable, uncomment the block below and restore UI controls/events.
@@ -235,11 +246,28 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
         preview_scene.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
     # Always keep a GLB preview for the 3D widget.
     preview_glb = os.path.join(outdir, 'scene.glb')
+    facade_preview_glb = os.path.join(outdir, 'scene_facade.glb') if (as_pointcloud and wall_slab and facade_pts is not None and len(facade_pts) > 0) else None
     dl_glb = os.path.join(outdir, 'scene_download.glb') if bool(save_glb) else None
     dl_ply = os.path.join(outdir, 'scene_download.ply') if bool(save_ply) else None
     if not silent:
         print('(exporting 3D preview to', preview_glb, ')')
     preview_scene.export(file_obj=preview_glb)
+
+    if facade_preview_glb is not None:
+        facade_scene = trimesh.Scene()
+        fc = facade_col if facade_col is not None else np.zeros((len(facade_pts), 3), dtype=np.float32)
+        facade_scene.add_geometry(trimesh.PointCloud(facade_pts.reshape(-1, 3), colors=fc.reshape(-1, 3)))
+        if slab_cut_lines is not None and len(slab_cut_lines) > 0:
+            facade_scene.add_geometry(trimesh.load_path(slab_cut_lines))
+        for i, pose_c2w in enumerate(cams2world):
+            if isinstance(cam_color, list):
+                camera_edge_color = cam_color[i]
+            else:
+                camera_edge_color = cam_color or CAM_COLORS[i % len(CAM_COLORS)]
+            add_scene_cam(facade_scene, pose_c2w, camera_edge_color,
+                          None if transparent_cams else imgs[i], focals[i],
+                          imsize=imgs[i].shape[1::-1], screen_width=cam_size)
+        facade_scene.export(file_obj=facade_preview_glb)
 
     if dl_glb is not None:
         # Download GLB keeps original aligned coordinates (no viewer-only transform).
@@ -248,7 +276,7 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
         pct = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
         pct.export(file_obj=dl_ply)
 
-    return preview_glb, dl_glb, dl_ply
+    return preview_glb, facade_preview_glb, dl_glb, dl_ply
 
 
 def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud=False, mask_sky=False,
@@ -279,7 +307,7 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
     extract 3D_model (glb file) from a reconstructed scene
     """
     if scene is None:
-        return None
+        return None, None, None, None
     # post processes
     if clean_depth:
         scene = scene.clean_pointcloud()
@@ -343,8 +371,8 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
 
 
 def get_3D_model_and_downloads(*args, **kwargs):
-    preview_glb, dl_glb, dl_ply = get_3D_model_from_scene(*args, **kwargs)
-    return preview_glb, dl_glb, dl_ply
+    preview_glb, facade_preview_glb, dl_glb, dl_ply = get_3D_model_from_scene(*args, **kwargs)
+    return preview_glb, (facade_preview_glb or preview_glb), dl_glb, dl_ply
 
 
 def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
@@ -389,7 +417,7 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
     if mode == GlobalAlignerMode.PointCloudOptimizer:
         loss = scene.compute_global_alignment(init='mst', niter=niter, schedule=schedule, lr=lr)
 
-    outfile, glbfile, plyfile = get_3D_model_from_scene(outdir, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
+    outfile, facade_outfile, glbfile, plyfile = get_3D_model_from_scene(outdir, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
                                                         clean_depth, transparent_cams, cam_size,
                                                         save_glb=save_glb,
                                                         save_ply=save_ply,
@@ -424,14 +452,14 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
         imgs.append(rgb(depths[i]))
         imgs.append(rgb(confs[i]))
 
-    return scene, outfile, imgs, glbfile, plyfile
+    return scene, outfile, facade_outfile, imgs, glbfile, plyfile
 
 
 def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
     num_files = len(inputfiles) if inputfiles is not None else 1
     max_winsize = max(1, math.ceil((num_files - 1) / 2))
     if scenegraph_type == "swin":
-        winsize = gradio.Slider(label="Scene Graph: Window Size", value=max_winsize,
+        winsize = gradio.Slider(label="Scene Graph: Window Size", value=1,
                                 minimum=1, maximum=max_winsize, step=1, visible=True)
         refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0,
                               maximum=num_files - 1, step=1, visible=False)
@@ -460,28 +488,28 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             with gradio.Row():
                 schedule = gradio.Dropdown(["linear", "cosine"],
                                            value='linear', label="schedule", info="For global alignment!")
-                niter = gradio.Number(value=300, precision=0, minimum=0, maximum=5000,
+                niter = gradio.Number(value=150, precision=0, minimum=0, maximum=5000,
                                       label="num_iterations", info="For global alignment!")
                 scenegraph_type = gradio.Dropdown([("complete: all possible image pairs", "complete"),
                                                    ("swin: sliding window", "swin"),
                                                    ("oneref: match one image with all", "oneref")],
-                                                  value='complete', label="Scenegraph",
+                                                  value='swin', label="Scenegraph",
                                                   info="Define how to make pairs",
                                                   interactive=True)
                 winsize = gradio.Slider(label="Scene Graph: Window Size", value=1,
-                                        minimum=1, maximum=1, step=1, visible=False)
+                                        minimum=1, maximum=1, step=1, visible=True)
                 refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0, maximum=0, step=1, visible=False)
 
             run_btn = gradio.Button("Run")
 
             with gradio.Row():
                 # adjust the confidence threshold
-                min_conf_thr = gradio.Slider(label="min_conf_thr", value=3.0, minimum=1.0, maximum=20, step=0.1)
+                min_conf_thr = gradio.Slider(label="min_conf_thr", value=13.0, minimum=1.0, maximum=20, step=0.1)
                 # adjust the camera size in the output pointcloud
-                cam_size = gradio.Slider(label="cam_size", value=0.05, minimum=0.001, maximum=0.1, step=0.001)
+                cam_size = gradio.Slider(label="cam_size", value=0.001, minimum=0.001, maximum=0.1, step=0.001)
             with gradio.Row():
-                save_glb = gradio.Checkbox(value=True, label="Enable GLB download")
-                save_ply = gradio.Checkbox(value=True, label="Enable PLY download")
+                save_glb = gradio.Checkbox(value=False, label="Enable GLB download")
+                save_ply = gradio.Checkbox(value=False, label="Enable PLY download")
                 align_ground_to_oxz_export = gradio.Checkbox(value=True, label="Align export to ground Oxz")
                 tsdf_fusion = gradio.Checkbox(value=False, label="TSDF fusion (view-based)")
                 view_consistent_merge = gradio.Checkbox(value=False, label="View-consistent merge (1 layer)")
@@ -496,7 +524,7 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                     label="slab_scale_tren", value=0.18, minimum=0.00, maximum=1.00, step=0.01
                 )
             with gradio.Row():
-                as_pointcloud = gradio.Checkbox(value=False, label="As pointcloud")
+                as_pointcloud = gradio.Checkbox(value=True, label="As pointcloud")
                 # two post process implemented
                 mask_sky = gradio.Checkbox(value=False, label="Mask sky")
                 clean_depth = gradio.Checkbox(value=True, label="Clean-up depthmaps")
@@ -511,7 +539,7 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                     info="low: ưu tiên mặt phẳng thấp theo trục Y, high: ưu tiên mặt phẳng cao",
                 )
                 ground_coplanar_angle_tol_deg = gradio.Slider(
-                    label="ground_coplanar_angle_tol_deg", value=6.0, minimum=1.0, maximum=20.0, step=0.5
+                    label="ground_coplanar_angle_tol_deg", value=3.0, minimum=1.0, maximum=20.0, step=0.5
                 )
                 ground_coplanar_offset_tol = gradio.Number(
                     label="ground_coplanar_offset_tol (-1 = auto)", value=-1.0, precision=6
@@ -558,6 +586,7 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             ]
 
             outmodel = gradio.Model3D()
+            outmodel_facade = gradio.Model3D(label="Facade Band Preview (Multi-layer Reduced)")
             outgallery = gradio.Gallery(label='rgb,depth,confidence', columns=3, height="100%")
             out_glb_file = gradio.File(label="Download scene.glb")
             out_ply_file = gradio.File(label="Download scene.ply")
@@ -581,67 +610,67 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                           ground_coplanar_offset_tol,
                           remove_outlier_cc,
                                   scenegraph_type, winsize, refid],
-                          outputs=[scene, outmodel, outgallery, out_glb_file, out_ply_file])
+                          outputs=[scene, outmodel, outmodel_facade, outgallery, out_glb_file, out_ply_file])
             min_conf_thr.release(fn=model_from_scene_fun,
                          inputs=export_inputs,
-                                 outputs=[outmodel, out_glb_file, out_ply_file])
+                                 outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             cam_size.change(fn=model_from_scene_fun,
                         inputs=export_inputs,
-                            outputs=[outmodel, out_glb_file, out_ply_file])
+                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             save_glb.change(fn=model_from_scene_fun,
                             inputs=export_inputs,
-                            outputs=[outmodel, out_glb_file, out_ply_file])
+                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             save_ply.change(fn=model_from_scene_fun,
                             inputs=export_inputs,
-                            outputs=[outmodel, out_glb_file, out_ply_file])
+                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             align_ground_to_oxz_export.change(fn=model_from_scene_fun,
                                               inputs=export_inputs,
-                                              outputs=[outmodel, out_glb_file, out_ply_file])
+                                              outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             tsdf_fusion.change(fn=model_from_scene_fun,
                                inputs=export_inputs,
-                               outputs=[outmodel, out_glb_file, out_ply_file])
+                               outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             view_consistent_merge.change(fn=model_from_scene_fun,
                                          inputs=export_inputs,
-                                         outputs=[outmodel, out_glb_file, out_ply_file])
+                                         outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             vcm_voxel_size.change(fn=model_from_scene_fun,
                                   inputs=export_inputs,
-                                  outputs=[outmodel, out_glb_file, out_ply_file])
+                                  outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             wall_slab.change(fn=model_from_scene_fun,
                          inputs=export_inputs,
-                         outputs=[outmodel, out_glb_file, out_ply_file])
+                         outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             slab_scale_duoi.release(fn=model_from_scene_fun,
                             inputs=export_inputs,
-                            outputs=[outmodel, out_glb_file, out_ply_file])
+                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             slab_scale_tren.release(fn=model_from_scene_fun,
                             inputs=export_inputs,
-                            outputs=[outmodel, out_glb_file, out_ply_file])
+                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             as_pointcloud.change(fn=model_from_scene_fun,
                          inputs=export_inputs,
-                                 outputs=[outmodel, out_glb_file, out_ply_file])
+                                 outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             mask_sky.change(fn=model_from_scene_fun,
                         inputs=export_inputs,
-                            outputs=[outmodel, out_glb_file, out_ply_file])
+                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             clean_depth.change(fn=model_from_scene_fun,
                            inputs=export_inputs,
-                               outputs=[outmodel, out_glb_file, out_ply_file])
+                               outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             transparent_cams.change(model_from_scene_fun,
                             inputs=export_inputs,
-                                    outputs=[outmodel, out_glb_file, out_ply_file])
+                                    outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             remove_ground.change(fn=model_from_scene_fun,
                                 inputs=export_inputs,
-                                outputs=[outmodel, out_glb_file, out_ply_file])
+                                outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             ground_y_preference.change(fn=model_from_scene_fun,
                                        inputs=export_inputs,
-                                       outputs=[outmodel, out_glb_file, out_ply_file])
+                                       outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             ground_coplanar_angle_tol_deg.release(fn=model_from_scene_fun,
                                                   inputs=export_inputs,
-                                                  outputs=[outmodel, out_glb_file, out_ply_file])
+                                                  outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             ground_coplanar_offset_tol.change(fn=model_from_scene_fun,
                                               inputs=export_inputs,
-                                              outputs=[outmodel, out_glb_file, out_ply_file])
+                                              outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             remove_outlier_cc.change(fn=model_from_scene_fun,
                                      inputs=export_inputs,
-                                     outputs=[outmodel, out_glb_file, out_ply_file])
+                                     outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             # statistic_plane events are temporarily hidden.
             # statistic_plane.change(fn=model_from_scene_fun,
             #                     inputs=export_inputs,

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal
 
 import numpy as np
+from scipy.spatial import ConvexHull
 
 from .remove_ground import align_pointcloud_to_ground_oxz
 
@@ -54,6 +55,15 @@ class WallSlabGridResult:
     slab_points: np.ndarray
     occupancy: OccupancyGrid2D
     cut_lines: np.ndarray
+    footprint_mask: np.ndarray
+    footprint_polygon_xz: np.ndarray
+    outer_boundary_xz: np.ndarray
+    source_points: np.ndarray
+    source_mask: np.ndarray
+    dist_to_footprint_boundary: np.ndarray
+    facade_band_width: float
+    facade_band_mask: np.ndarray
+    facade_band_points: np.ndarray
 
 
 def _validate_points_colors(
@@ -289,6 +299,274 @@ def build_slab_cut_lines(
     return np.concatenate([_rect_segments(float(y0)), _rect_segments(float(y1))], axis=0)
 
 
+def _binary_dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return mask.copy()
+    h, w = mask.shape
+    out = np.zeros_like(mask, dtype=bool)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx * dx + dy * dy > radius * radius:
+                continue
+            ys0 = max(0, -dy)
+            ys1 = min(h, h - dy)
+            xs0 = max(0, -dx)
+            xs1 = min(w, w - dx)
+            yd0 = max(0, dy)
+            yd1 = min(h, h + dy)
+            xd0 = max(0, dx)
+            xd1 = min(w, w + dx)
+            out[yd0:yd1, xd0:xd1] |= mask[ys0:ys1, xs0:xs1]
+    return out
+
+
+def _binary_erode(mask: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return mask.copy()
+    h, w = mask.shape
+    out = np.ones_like(mask, dtype=bool)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx * dx + dy * dy > radius * radius:
+                continue
+            shifted = np.zeros_like(mask, dtype=bool)
+            ys0 = max(0, -dy)
+            ys1 = min(h, h - dy)
+            xs0 = max(0, -dx)
+            xs1 = min(w, w - dx)
+            yd0 = max(0, dy)
+            yd1 = min(h, h + dy)
+            xd0 = max(0, dx)
+            xd1 = min(w, w + dx)
+            shifted[yd0:yd1, xd0:xd1] = mask[ys0:ys1, xs0:xs1]
+            out &= shifted
+    return out
+
+
+def morphological_closing(mask: np.ndarray, kernel_radius: int = 2) -> np.ndarray:
+    """Binary closing (dilate then erode) with disk-like kernel in grid cells."""
+    r = int(max(0, kernel_radius))
+    if r == 0:
+        return mask.astype(bool, copy=True)
+    dil = _binary_dilate(mask.astype(bool), r)
+    return _binary_erode(dil, r)
+
+
+def _largest_component(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    best_coords = None
+    best_size = 0
+
+    for y in range(h):
+        for x in range(w):
+            if not mask[y, x] or visited[y, x]:
+                continue
+            stack = [(y, x)]
+            visited[y, x] = True
+            coords = []
+            while stack:
+                cy, cx = stack.pop()
+                coords.append((cy, cx))
+                for ny in range(max(0, cy - 1), min(h, cy + 2)):
+                    for nx in range(max(0, cx - 1), min(w, cx + 2)):
+                        if visited[ny, nx] or not mask[ny, nx]:
+                            continue
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+            if len(coords) > best_size:
+                best_size = len(coords)
+                best_coords = coords
+
+    out = np.zeros_like(mask, dtype=bool)
+    if best_coords is not None:
+        yy = np.array([c[0] for c in best_coords], dtype=np.int64)
+        xx = np.array([c[1] for c in best_coords], dtype=np.int64)
+        out[yy, xx] = True
+    return out
+
+
+def _mark_exterior_empty(occupied_mask: np.ndarray) -> np.ndarray:
+    """Flood-fill empty cells from border to mark true exterior region."""
+    h, w = occupied_mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    stack = []
+
+    for x in range(w):
+        stack.append((0, x))
+        stack.append((h - 1, x))
+    for y in range(h):
+        stack.append((y, 0))
+        stack.append((y, w - 1))
+
+    while stack:
+        y, x = stack.pop()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            continue
+        if visited[y, x] or occupied_mask[y, x]:
+            continue
+        visited[y, x] = True
+        stack.append((y - 1, x))
+        stack.append((y + 1, x))
+        stack.append((y, x - 1))
+        stack.append((y, x + 1))
+    return visited
+
+
+def _boundary_from_component(component_mask: np.ndarray) -> np.ndarray:
+    h, w = component_mask.shape
+    boundary = np.zeros_like(component_mask, dtype=bool)
+    yy, xx = np.where(component_mask)
+    for y, x in zip(yy, xx):
+        if y == 0 or y == h - 1 or x == 0 or x == w - 1:
+            boundary[y, x] = True
+            continue
+        if (
+            (not component_mask[y - 1, x])
+            or (not component_mask[y + 1, x])
+            or (not component_mask[y, x - 1])
+            or (not component_mask[y, x + 1])
+        ):
+            boundary[y, x] = True
+    return boundary
+
+
+def _outer_boundary_from_component(component_mask: np.ndarray) -> np.ndarray:
+    """Boundary cells that touch the true exterior (not interior courtyards)."""
+    exterior_empty = _mark_exterior_empty(component_mask)
+    h, w = component_mask.shape
+    outer = np.zeros_like(component_mask, dtype=bool)
+
+    yy, xx = np.where(component_mask)
+    for y, x in zip(yy, xx):
+        if y > 0 and exterior_empty[y - 1, x]:
+            outer[y, x] = True
+            continue
+        if y + 1 < h and exterior_empty[y + 1, x]:
+            outer[y, x] = True
+            continue
+        if x > 0 and exterior_empty[y, x - 1]:
+            outer[y, x] = True
+            continue
+        if x + 1 < w and exterior_empty[y, x + 1]:
+            outer[y, x] = True
+            continue
+    return outer
+
+
+def _grid_cells_to_xz(ij: np.ndarray, origin_xz: np.ndarray, cell_size: float) -> np.ndarray:
+    if len(ij) == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    # ij is (row=z, col=x), convert to center coordinates in XZ.
+    x = origin_xz[0] + (ij[:, 1].astype(np.float64) + 0.5) * cell_size
+    z = origin_xz[1] + (ij[:, 0].astype(np.float64) + 0.5) * cell_size
+    return np.stack([x, z], axis=1)
+
+
+def extract_outer_footprint_polygon(
+    occupancy: OccupancyGrid2D,
+    *,
+    closing_radius_cells: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Step 4: occupancy -> closing -> largest outer boundary -> footprint polygon."""
+    occ_mask = occupancy.counts > 0
+    closed = morphological_closing(occ_mask, kernel_radius=int(closing_radius_cells))
+    largest = _largest_component(closed)
+    boundary = _outer_boundary_from_component(largest)
+    if not np.any(boundary):
+        boundary = _boundary_from_component(largest)
+
+    boundary_ij = np.argwhere(boundary)
+    boundary_xz = _grid_cells_to_xz(boundary_ij, occupancy.origin_xz, occupancy.cell_size)
+
+    if len(boundary_xz) < 3:
+        return largest, boundary_xz
+
+    try:
+        hull = ConvexHull(boundary_xz)
+        poly = boundary_xz[hull.vertices]
+    except Exception:
+        c = np.mean(boundary_xz, axis=0)
+        ang = np.arctan2(boundary_xz[:, 1] - c[1], boundary_xz[:, 0] - c[0])
+        poly = boundary_xz[np.argsort(ang)]
+
+    return largest, poly
+
+
+def _point_to_segment_distance_2d(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom <= 1e-12:
+        return np.linalg.norm(points - a[None, :], axis=1)
+    t = ((points - a[None, :]) @ ab) / denom
+    t = np.clip(t, 0.0, 1.0)
+    proj = a[None, :] + t[:, None] * ab[None, :]
+    return np.linalg.norm(points - proj, axis=1)
+
+
+def distance_to_boundary_points(points_xz: np.ndarray, boundary_xz: np.ndarray) -> np.ndarray:
+    """Nearest distance from each point to sampled boundary points in XZ."""
+    if len(points_xz) == 0:
+        return np.zeros((0,), dtype=np.float64)
+    if len(boundary_xz) == 0:
+        return np.full((len(points_xz),), np.inf, dtype=np.float64)
+
+    dmin = np.full((len(points_xz),), np.inf, dtype=np.float64)
+    chunk = 4096
+    for i in range(0, len(boundary_xz), chunk):
+        b = boundary_xz[i:i + chunk]
+        diff = points_xz[:, None, :] - b[None, :, :]
+        d = np.linalg.norm(diff, axis=2)
+        dmin = np.minimum(dmin, np.min(d, axis=1))
+    return dmin
+
+
+def distance_to_polygon_boundary(points_xz: np.ndarray, polygon_xz: np.ndarray) -> np.ndarray:
+    if len(points_xz) == 0:
+        return np.zeros((0,), dtype=np.float64)
+    if len(polygon_xz) < 2:
+        return np.full((len(points_xz),), np.inf, dtype=np.float64)
+
+    n = len(polygon_xz)
+    dmin = np.full((len(points_xz),), np.inf, dtype=np.float64)
+    for i in range(n):
+        a = polygon_xz[i]
+        b = polygon_xz[(i + 1) % n]
+        d = _point_to_segment_distance_2d(points_xz, a, b)
+        dmin = np.minimum(dmin, d)
+    return dmin
+
+
+def select_outer_facade_band(
+    source_points: np.ndarray,
+    footprint_polygon_xz: np.ndarray,
+    outer_boundary_xz: Optional[np.ndarray] = None,
+    *,
+    xz_span: float,
+    band_ratio: float = 0.02,
+    band_ratio_min: float = 0.01,
+    band_ratio_max: float = 0.03,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Step 5: keep points near footprint outer boundary within facade band width."""
+    pts = np.asarray(source_points)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("source_points must be (N, 3)")
+
+    ratio = float(np.clip(band_ratio, band_ratio_min, band_ratio_max))
+    bw = float(max(float(xz_span) * ratio, 1e-9))
+
+    if len(pts) == 0:
+        return np.zeros((0,), dtype=bool), np.zeros((0,), dtype=np.float64), bw
+
+    pxz = pts[:, [0, 2]].astype(np.float64)
+    if outer_boundary_xz is not None and len(outer_boundary_xz) > 0:
+        dist = distance_to_boundary_points(pxz, np.asarray(outer_boundary_xz, dtype=np.float64))
+    else:
+        dist = distance_to_polygon_boundary(pxz, np.asarray(footprint_polygon_xz, dtype=np.float64))
+    keep = dist <= bw
+    return keep, dist, bw
+
+
 def wall_slab_grid_from_points(
     points: np.ndarray,
     colors: Optional[np.ndarray] = None,
@@ -304,9 +582,14 @@ def wall_slab_grid_from_points(
     cell_ratio: float = 0.006,
     cell_ratio_min: float = 0.004,
     cell_ratio_max: float = 0.010,
+    closing_radius_cells: int = 2,
+    facade_source: Literal["slab", "all"] = "slab",
+    facade_band_ratio: float = 0.02,
+    facade_band_ratio_min: float = 0.01,
+    facade_band_ratio_max: float = 0.03,
     strict: bool = False,
 ) -> WallSlabGridResult:
-    """Run wall-slab pipeline: align -> slab cut by y-span -> occupancy grid in XZ."""
+    """Run wall-slab pipeline with outer-footprint + outer-facade band selection."""
     pts, cols = _validate_points_colors(points, colors)
 
     aligned = False
@@ -347,6 +630,32 @@ def wall_slab_grid_from_points(
         cell_ratio_max=float(cell_ratio_max),
     )
 
+    footprint_mask, footprint_polygon_xz = extract_outer_footprint_polygon(
+        occupancy,
+        closing_radius_cells=int(closing_radius_cells),
+    )
+    outer_boundary_ij = np.argwhere(_outer_boundary_from_component(footprint_mask))
+    outer_boundary_xz = _grid_cells_to_xz(outer_boundary_ij, occupancy.origin_xz, occupancy.cell_size)
+
+    source_mode = str(facade_source).lower()
+    if source_mode == "all":
+        source_points = out_pts
+        source_mask = np.ones((len(out_pts),), dtype=bool)
+    else:
+        source_points = slab_points
+        source_mask = slab_mask
+
+    facade_band_mask, dist_to_boundary, facade_band_width = select_outer_facade_band(
+        source_points,
+        footprint_polygon_xz,
+        outer_boundary_xz=outer_boundary_xz,
+        xz_span=float(bbox.xz_span),
+        band_ratio=float(facade_band_ratio),
+        band_ratio_min=float(facade_band_ratio_min),
+        band_ratio_max=float(facade_band_ratio_max),
+    )
+    facade_band_points = source_points[facade_band_mask]
+
     cut_lines = build_slab_cut_lines(
         bbox.bbox_min,
         bbox.bbox_max,
@@ -365,4 +674,13 @@ def wall_slab_grid_from_points(
         slab_points=slab_points,
         occupancy=occupancy,
         cut_lines=cut_lines,
+        footprint_mask=footprint_mask,
+        footprint_polygon_xz=footprint_polygon_xz,
+        outer_boundary_xz=outer_boundary_xz,
+        source_points=source_points,
+        source_mask=source_mask,
+        dist_to_footprint_boundary=dist_to_boundary,
+        facade_band_width=facade_band_width,
+        facade_band_mask=facade_band_mask,
+        facade_band_points=facade_band_points,
     )
