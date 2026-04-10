@@ -178,11 +178,7 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
             scale_tren=float(slab_scale_tren),
             strict=False,
         )
-        pts = slab_res.slab_points
-        if slab_res.colors is not None:
-            col = slab_res.colors[slab_res.slab_mask]
-        else:
-            col = np.zeros((len(pts), 3), dtype=np.float32)
+        # Keep cloud unchanged; wall slab is used to compute/visualize cut range only.
         slab_cut_lines = slab_res.cut_lines
 
     # statistic_plane is temporarily hidden/disabled.
