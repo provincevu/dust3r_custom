@@ -9,6 +9,7 @@ from dust3r.utils.image import load_images
 from dust3r.image_pairs import make_pairs
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from dust3r.utils.custom import remove_ground
+from dust3r.utils.custom import align_pointcloud_to_ground_oxz
 from dust3r.utils.custom import remove_outlier_cc
 from dust3r.utils.custom import tsdf_fuse_views
 from dust3r.utils.custom import view_consistent_merge
@@ -37,6 +38,8 @@ def main():
     parser.add_argument("--tsdf-fusion", action="store_true", help="Fuse depth maps per view with Open3D TSDF before post-processing")
     parser.add_argument("--view-consistent-merge", action="store_true", help="Merge near-duplicate points from multi-view into one layer")
     parser.add_argument("--vcm-voxel-size", type=float, default=0.005, help="Voxel size for view-consistent merge")
+    parser.add_argument("--no-align-ground-to-oxz", action="store_true",
+                        help="Disable aligning exported point cloud coordinates to ground Oxz plane")
     # parser.add_argument("--statistic-plane", action="store_true", help="Flatten planar surfaces using Open3D RSPD patches")
     args = parser.parse_args()
 
@@ -168,6 +171,7 @@ def main():
                 merged_points,
                 merged_colors,
                 enabled=True,
+                align_ground_to_oxz=not bool(args.no_align_ground_to_oxz),
                 y_preference=str(args.ground_y_preference),
                 coplanar_angle_tol_deg=float(args.ground_coplanar_angle_tol_deg),
                 coplanar_offset_tol=coplanar_offset_tol,
@@ -176,6 +180,19 @@ def main():
             merged_points = res.points
             if res.colors is not None:
                 merged_colors = res.colors
+
+        if (not args.remove_ground) and (not args.no_align_ground_to_oxz):
+            align_res = align_pointcloud_to_ground_oxz(
+                merged_points,
+                merged_colors,
+                enabled=True,
+                strict=False,
+            )
+            merged_points = align_res.points
+            if align_res.colors is not None:
+                merged_colors = align_res.colors
+            if align_res.aligned:
+                print("Aligned exported cloud to ground Oxz")
 
         if args.remove_outlier_cc:
             res = remove_outlier_cc(

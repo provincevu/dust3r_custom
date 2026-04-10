@@ -12,6 +12,16 @@ class RemoveGroundResult:
     colors: Optional[np.ndarray]
     kept_mask: np.ndarray
     plane_model: Optional[Tuple[float, float, float, float]]
+    transform: Optional[np.ndarray] = None
+
+
+@dataclass(frozen=True)
+class AlignGroundResult:
+    points: np.ndarray
+    colors: Optional[np.ndarray]
+    plane_model: Optional[Tuple[float, float, float, float]]
+    transform: Optional[np.ndarray]
+    aligned: bool
 
 
 def _unit(vec: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -161,6 +171,126 @@ def _plane_basis_from_normal(n: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return u, v
 
 
+def _rotation_matrix_from_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Return R such that R @ a ~= b for unit vectors a,b."""
+    a = _unit(a)
+    b = _unit(b)
+    c = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    if c > 1.0 - 1e-10:
+        return np.eye(3, dtype=np.float64)
+    if c < -1.0 + 1e-10:
+        # 180 deg: pick any orthogonal axis.
+        axis = _unit(np.cross(a, np.array([1.0, 0.0, 0.0], dtype=np.float64)))
+        if np.linalg.norm(axis) < 1e-8:
+            axis = _unit(np.cross(a, np.array([0.0, 0.0, 1.0], dtype=np.float64)))
+        x, y, z = axis
+        K = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]], dtype=np.float64)
+        # Rodrigues with theta=pi -> R = I + 2*K^2
+        return np.eye(3, dtype=np.float64) + 2.0 * (K @ K)
+
+    v = np.cross(a, b)
+    s = np.linalg.norm(v)
+    K = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=np.float64)
+    R = np.eye(3, dtype=np.float64) + K + (K @ K) * ((1.0 - c) / (s * s + 1e-12))
+    return R
+
+
+def _align_points_ground_to_oxz(
+    points: np.ndarray,
+    plane_model: Optional[Tuple[float, float, float, float]],
+) -> Tuple[np.ndarray, Optional[Tuple[float, float, float, float]], Optional[np.ndarray]]:
+    """Rotate (and shift Y) so the detected ground plane aligns to Oxz (y=0)."""
+    if plane_model is None or len(points) == 0:
+        return points, plane_model, None
+
+    n, d = _plane_unit_canonical(plane_model)
+    # Prefer +Y as up to keep orientation stable.
+    if n[1] > 0:
+        n = -n
+        d = -d
+
+    target = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    R = _rotation_matrix_from_vectors(n, target)
+
+    pts64 = np.asarray(points, dtype=np.float64)
+    rot_pts = (R @ pts64.T).T
+
+    # Shift along Y so plane is at y=0.
+    p0 = (-d) * n
+    p0r = R @ p0
+    y_shift = -float(p0r[1])
+    rot_pts[:, 1] += y_shift
+
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = np.array([0.0, y_shift, 0.0], dtype=np.float64)
+
+    # After alignment, ground is y=0.
+    aligned_plane = (0.0, 1.0, 0.0, 0.0)
+    return rot_pts.astype(points.dtype, copy=False), aligned_plane, T
+
+
+def align_pointcloud_to_ground_oxz(
+    points: np.ndarray,
+    colors: Optional[np.ndarray] = None,
+    *,
+    enabled: bool = True,
+    distance_threshold: float = 0.005,
+    ransac_n: int = 3,
+    num_iterations: int = 1200,
+    min_plane_inliers: int = 500,
+    strict: bool = False,
+) -> AlignGroundResult:
+    """Align the full cloud to a detected dominant plane so ground becomes Oxz.
+
+    Unlike ``remove_ground``, this utility does not remove points. It estimates one
+    dominant plane, rotates the full point cloud to make that plane ``y=0``, and
+    returns transformed coordinates for downstream export.
+    """
+    pts = np.asarray(points)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("points must be (N, 3)")
+
+    if colors is not None:
+        cols = np.asarray(colors)
+        if cols.shape[0] != pts.shape[0] or cols.shape[1] != 3:
+            raise ValueError("colors must be (N, 3) and match points")
+    else:
+        cols = None
+
+    if (not enabled) or len(pts) == 0:
+        return AlignGroundResult(points=pts, colors=cols, plane_model=None, transform=None, aligned=False)
+
+    try:
+        import open3d as o3d  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        if strict:
+            raise ImportError(
+                "align_pointcloud_to_ground_oxz(enabled=True) requires open3d. Install with: pip install open3d"
+            ) from exc
+        return AlignGroundResult(points=pts, colors=cols, plane_model=None, transform=None, aligned=False)
+
+    pts64 = np.asarray(pts, dtype=np.float64)
+    plane_model, inliers = _try_segment_plane(
+        o3d,
+        pts64,
+        distance_threshold=distance_threshold,
+        ransac_n=ransac_n,
+        num_iterations=num_iterations,
+    )
+    if plane_model is None or len(inliers) < int(min_plane_inliers):
+        return AlignGroundResult(points=pts, colors=cols, plane_model=None, transform=None, aligned=False)
+
+    out_pts, out_plane, transform = _align_points_ground_to_oxz(pts, plane_model)
+    return AlignGroundResult(
+        points=out_pts,
+        colors=cols,
+        plane_model=out_plane,
+        transform=transform,
+        aligned=transform is not None,
+    )
+
+
 def _plane_2d_stats(points_on_plane: np.ndarray, normal: np.ndarray, grid_size: int = 12) -> Tuple[float, float]:
     """Return (point_density, center_hole_score) from 2D plane projection.
 
@@ -198,6 +328,172 @@ def _plane_2d_stats(points_on_plane: np.ndarray, normal: np.ndarray, grid_size: 
     return density, center_hole_score
 
 
+def _mark_exterior_free_space(blocked: np.ndarray) -> np.ndarray:
+    """Flood-fill free cells from border to mark exterior region."""
+    h, w = blocked.shape
+    visited = np.zeros((h, w), dtype=bool)
+    stack: List[Tuple[int, int]] = []
+
+    for x in range(w):
+        stack.append((0, x))
+        stack.append((h - 1, x))
+    for y in range(h):
+        stack.append((y, 0))
+        stack.append((y, w - 1))
+
+    while stack:
+        y, x = stack.pop()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            continue
+        if visited[y, x] or blocked[y, x]:
+            continue
+        visited[y, x] = True
+        stack.append((y - 1, x))
+        stack.append((y + 1, x))
+        stack.append((y, x - 1))
+        stack.append((y, x + 1))
+    return visited
+
+
+def _rebuild_ground_in_object_footprint(
+    points: np.ndarray,
+    colors: Optional[np.ndarray],
+    kept_mask: np.ndarray,
+    plane_model: Optional[Tuple[float, float, float, float]],
+    *,
+    enabled: bool,
+    distance_threshold: float,
+    cell_size: Optional[float],
+    max_points: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Recreate ground only inside enclosed interior footprint of the object.
+
+    The interior region is estimated by projecting near-ground object points to the
+    selected ground plane, rasterizing boundary cells, then flood-filling from map
+    borders to remove exterior area. Remaining free cells are treated as interior.
+    """
+    pts = np.asarray(points)
+    cols = None if colors is None else np.asarray(colors)
+
+    if (not enabled) or plane_model is None or len(pts) == 0:
+        return pts[kept_mask], (cols[kept_mask] if cols is not None else None)
+
+    obj_pts = pts[kept_mask]
+    if len(obj_pts) < 10:
+        return pts[kept_mask], (cols[kept_mask] if cols is not None else None)
+
+    n, d = _plane_unit_canonical(plane_model)
+    u, v = _plane_basis_from_normal(n)
+
+    signed_obj = obj_pts @ n + d
+    # Ensure object is mostly on positive side of the plane for stable thresholding.
+    if float(np.nanmedian(signed_obj)) < 0:
+        n = -n
+        d = -d
+        u, v = _plane_basis_from_normal(n)
+        signed_obj = obj_pts @ n + d
+
+    # Use only near-ground shell of the object (walls/furniture near floor) as boundary.
+    h_band = max(6.0 * float(distance_threshold), float(np.quantile(np.clip(signed_obj, 0.0, None), 0.20)))
+    ring_sel = (signed_obj >= 0.0) & (signed_obj <= h_band)
+    ring_pts = obj_pts[ring_sel]
+    if len(ring_pts) < 20:
+        return pts[kept_mask], (cols[kept_mask] if cols is not None else None)
+
+    uv = np.stack((ring_pts @ u, ring_pts @ v), axis=1)
+    mn = np.min(uv, axis=0)
+    mx = np.max(uv, axis=0)
+    span = np.maximum(mx - mn, 1e-9)
+
+    if cell_size is None:
+        cs = max(float(distance_threshold) * 2.0, float(np.linalg.norm(span)) / 350.0, 1e-4)
+    else:
+        cs = max(float(cell_size), 1e-6)
+
+    ij = np.floor((uv - mn[None, :]) / cs).astype(np.int64)
+    if len(ij) == 0:
+        return pts[kept_mask], (cols[kept_mask] if cols is not None else None)
+
+    ij -= np.min(ij, axis=0, keepdims=True)
+    gh = int(np.max(ij[:, 0]) + 1)
+    gw = int(np.max(ij[:, 1]) + 1)
+    blocked = np.zeros((gh, gw), dtype=bool)
+    blocked[ij[:, 0], ij[:, 1]] = True
+
+    exterior = _mark_exterior_free_space(blocked)
+    interior = (~blocked) & (~exterior)
+    interior_idx = np.argwhere(interior)
+    if len(interior_idx) == 0:
+        return pts[kept_mask], (cols[kept_mask] if cols is not None else None)
+
+    if len(interior_idx) > int(max_points):
+        step = int(np.ceil(len(interior_idx) / float(max_points)))
+        interior_idx = interior_idx[::step]
+
+    origin_idx = np.min(np.floor((uv - mn[None, :]) / cs).astype(np.int64), axis=0)
+    ij_global = interior_idx.astype(np.int64) + origin_idx[None, :]
+    uv_center = mn[None, :] + (ij_global.astype(np.float64) + 0.5) * cs
+    p0 = (-d) * n
+    reg_pts = p0[None, :] + uv_center[:, 0:1] * u[None, :] + uv_center[:, 1:2] * v[None, :]
+
+    base_pts = pts[kept_mask]
+    out_pts = np.concatenate([base_pts, reg_pts.astype(base_pts.dtype, copy=False)], axis=0)
+
+    if cols is None:
+        return out_pts, None
+
+    base_cols = cols[kept_mask]
+    removed_cols = cols[~kept_mask]
+    if len(removed_cols) > 0:
+        fill_color = np.median(removed_cols.astype(np.float64), axis=0)
+    else:
+        fill_color = np.median(base_cols.astype(np.float64), axis=0) if len(base_cols) > 0 else np.array([0, 0, 0], dtype=np.float64)
+
+    if np.issubdtype(base_cols.dtype, np.integer):
+        fill_color = np.clip(np.rint(fill_color), 0, 255).astype(base_cols.dtype)
+    else:
+        fill_color = np.clip(fill_color, 0.0, 1.0).astype(base_cols.dtype)
+
+    reg_cols = np.repeat(fill_color[None, :], len(reg_pts), axis=0)
+    out_cols = np.concatenate([base_cols, reg_cols], axis=0)
+    return out_pts, out_cols
+
+
+def _finalize_remove_ground(
+    pts: np.ndarray,
+    cols: Optional[np.ndarray],
+    kept: np.ndarray,
+    plane_model: Optional[Tuple[float, float, float, float]],
+    *,
+    regenerate_ground: bool,
+    regenerate_cell_size: Optional[float],
+    regenerate_max_points: int,
+    distance_threshold: float,
+    align_ground_to_oxz: bool,
+    pre_transform: Optional[np.ndarray],
+) -> RemoveGroundResult:
+    new_pts, new_cols = _rebuild_ground_in_object_footprint(
+        pts,
+        cols,
+        kept,
+        plane_model,
+        enabled=bool(regenerate_ground),
+        distance_threshold=float(distance_threshold),
+        cell_size=regenerate_cell_size,
+        max_points=int(regenerate_max_points),
+    )
+    transform = None
+    plane_out = plane_model
+    if align_ground_to_oxz:
+        new_pts, plane_out, transform = _align_points_ground_to_oxz(new_pts, plane_model)
+    if pre_transform is not None:
+        if transform is None:
+            transform = pre_transform
+        else:
+            transform = transform @ pre_transform
+    return RemoveGroundResult(points=new_pts, colors=new_cols, kept_mask=kept, plane_model=plane_out, transform=transform)
+
+
 def remove_ground(
     points: np.ndarray,
     colors: Optional[np.ndarray] = None,
@@ -211,6 +507,10 @@ def remove_ground(
     y_preference: Literal["high", "low"] = "low",
     coplanar_angle_tol_deg: float = 6.0,
     coplanar_offset_tol: Optional[float] = None,
+    regenerate_ground: bool = True,
+    regenerate_cell_size: Optional[float] = None,
+    regenerate_max_points: int = 120000,
+    align_ground_to_oxz: bool = True,
     normal_alignment_threshold: float = 0.95,
     bottom_quantile_threshold: float = 0.20,
     bottom_removal_margin: float = 0.15,
@@ -258,7 +558,13 @@ def remove_ground(
                 - y_preference: choose whether higher-Y or lower-Y planes are preferred.
                 - coplanar_angle_tol_deg / coplanar_offset_tol: near-coplanar matching
                     thresholds to remove fragmented pieces of the same ground plane.
-        - orthogonal_tol_deg: tolerance for considering two plane normals orthogonal
+                - regenerate_ground: after removing detected ground, recreate a ground layer
+                    only under the object's footprint (projected on the selected plane).
+                - regenerate_cell_size / regenerate_max_points: controls regenerated ground
+                    sampling density and cap.
+                - align_ground_to_oxz: rotate full output cloud so selected ground aligns
+                    with Oxz (y=0).
+                - orthogonal_tol_deg: tolerance for considering two plane normals orthogonal
             (in degrees).
         - extreme_quantile: how close to an extreme the ground plane should be
             along its own normal direction.
@@ -287,7 +593,7 @@ def remove_ground(
 
     if not enabled or len(pts) == 0:
         kept = np.ones((len(pts),), dtype=bool)
-        return RemoveGroundResult(points=pts, colors=cols, kept_mask=kept, plane_model=None)
+        return RemoveGroundResult(points=pts, colors=cols, kept_mask=kept, plane_model=None, transform=None)
 
     try:
         import open3d as o3d  # type: ignore
@@ -297,9 +603,25 @@ def remove_ground(
                 "remove_ground(enabled=True) requires open3d. Install with: pip install open3d"
             ) from exc
         kept = np.ones((len(pts),), dtype=bool)
-        return RemoveGroundResult(points=pts, colors=cols, kept_mask=kept, plane_model=None)
+        return RemoveGroundResult(points=pts, colors=cols, kept_mask=kept, plane_model=None, transform=None)
 
     pts64 = np.asarray(pts, dtype=np.float64)
+    pre_transform: Optional[np.ndarray] = None
+
+    # Optional pre-alignment so removal runs in a frame where ground ~ Oxz.
+    if align_ground_to_oxz:
+        pre_plane, pre_inliers = _try_segment_plane(
+            o3d,
+            pts64,
+            distance_threshold=distance_threshold,
+            ransac_n=ransac_n,
+            num_iterations=max(800, int(num_iterations) // 2),
+        )
+        if pre_plane is not None and len(pre_inliers) >= int(min_plane_inliers):
+            aligned_pts, _, Tpre = _align_points_ground_to_oxz(pts64, pre_plane)
+            pts = aligned_pts.astype(pts.dtype, copy=False)
+            pts64 = np.asarray(pts, dtype=np.float64)
+            pre_transform = Tpre
 
     # Strategy -1: Multi-RANSAC + scored plane ranking.
     if strategy == "ransac_scored":
@@ -394,13 +716,17 @@ def remove_ground(
                 remove[inliers] = True
 
                 kept = ~remove
-                new_pts = pts[kept]
-                new_cols = cols[kept] if cols is not None else None
-                return RemoveGroundResult(
-                    points=new_pts,
-                    colors=new_cols,
-                    kept_mask=kept,
-                    plane_model=best_plane["plane_model"],
+                return _finalize_remove_ground(
+                    pts,
+                    cols,
+                    kept,
+                    best_plane["plane_model"],
+                    regenerate_ground=regenerate_ground,
+                    regenerate_cell_size=regenerate_cell_size,
+                    regenerate_max_points=regenerate_max_points,
+                    distance_threshold=distance_threshold,
+                    align_ground_to_oxz=False,
+                    pre_transform=pre_transform,
                 )
 
         # fallback
@@ -493,13 +819,22 @@ def remove_ground(
                     remove = np.zeros((len(pts64),), dtype=bool)
                     remove[np.asarray(best["inliers"], dtype=np.int64)] = True
                     kept = ~remove
-                    new_pts = pts[kept]
-                    new_cols = cols[kept] if cols is not None else None
                     p0 = np.asarray(best["center"], dtype=np.float64)
                     n = _unit(np.asarray(best["normal"], dtype=np.float64))
                     d = -float(np.dot(n, p0))
                     plane_model = (float(n[0]), float(n[1]), float(n[2]), float(d))
-                    return RemoveGroundResult(points=new_pts, colors=new_cols, kept_mask=kept, plane_model=plane_model)
+                    return _finalize_remove_ground(
+                        pts,
+                        cols,
+                        kept,
+                        plane_model,
+                        regenerate_ground=regenerate_ground,
+                        regenerate_cell_size=regenerate_cell_size,
+                        regenerate_max_points=regenerate_max_points,
+                        distance_threshold=distance_threshold,
+                        align_ground_to_oxz=False,
+                        pre_transform=pre_transform,
+                    )
 
         # fallback
         strategy = "orthogonal"
@@ -579,9 +914,18 @@ def remove_ground(
                     remove = (dist <= float(distance_threshold)) & (signed > 0)
 
                 kept = ~remove
-                new_pts = pts[kept]
-                new_cols = cols[kept] if cols is not None else None
-                return RemoveGroundResult(points=new_pts, colors=new_cols, kept_mask=kept, plane_model=plane_model)
+                return _finalize_remove_ground(
+                    pts,
+                    cols,
+                    kept,
+                    plane_model,
+                    regenerate_ground=regenerate_ground,
+                    regenerate_cell_size=regenerate_cell_size,
+                    regenerate_max_points=regenerate_max_points,
+                    distance_threshold=distance_threshold,
+                    align_ground_to_oxz=False,
+                    pre_transform=pre_transform,
+                )
 
         # fallback
         strategy = "bottom_slice"
@@ -629,7 +973,7 @@ def remove_ground(
 
     if best is None or best_axis is None:
         kept = np.ones((len(pts64),), dtype=bool)
-        return RemoveGroundResult(points=pts, colors=cols, kept_mask=kept, plane_model=None)
+        return RemoveGroundResult(points=pts, colors=cols, kept_mask=kept, plane_model=None, transform=pre_transform)
 
     plane_model = best["plane_model"]
     axis = int(best_axis)
@@ -640,6 +984,15 @@ def remove_ground(
     remove = (dist <= float(distance_threshold)) & (coord <= q_remove)
 
     kept = ~remove
-    new_pts = pts[kept]
-    new_cols = cols[kept] if cols is not None else None
-    return RemoveGroundResult(points=new_pts, colors=new_cols, kept_mask=kept, plane_model=plane_model)
+    return _finalize_remove_ground(
+        pts,
+        cols,
+        kept,
+        plane_model,
+        regenerate_ground=regenerate_ground,
+        regenerate_cell_size=regenerate_cell_size,
+        regenerate_max_points=regenerate_max_points,
+        distance_threshold=distance_threshold,
+        align_ground_to_oxz=False,
+        pre_transform=pre_transform,
+    )

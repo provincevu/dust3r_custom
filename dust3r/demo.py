@@ -68,9 +68,13 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
                                  transparent_cams=False, silent=False,
                                  save_glb=True,
                                  save_ply=True,
+                                 align_ground_to_oxz_export=True,
                                  tsdf_fusion=False,
                                  view_consistent_merge=False,
                                  vcm_voxel_size=0.005,
+                                 wall_slab=False,
+                                 slab_scale_duoi=0.02,
+                                 slab_scale_tren=0.18,
                                  remove_ground=False,
                                  ground_y_preference="low",
                                  ground_coplanar_angle_tol_deg=6.0,
@@ -93,6 +97,7 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
     cams2world = to_numpy(cams2world)
 
     scene = trimesh.Scene()
+    slab_cut_lines = None
 
     # full pointcloud (also used for PLY export)
     if precomputed_points is not None:
@@ -117,6 +122,18 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
         pts = vcm_res.points
         col = vcm_res.colors if vcm_res.colors is not None else col
 
+    if as_pointcloud and (not remove_ground) and align_ground_to_oxz_export:
+        from dust3r.utils.custom import align_pointcloud_to_ground_oxz as _align_pointcloud_to_ground_oxz
+
+        align_res = _align_pointcloud_to_ground_oxz(
+            pts.reshape(-1, 3),
+            col.reshape(-1, 3),
+            enabled=True,
+            strict=False,
+        )
+        pts = align_res.points
+        col = align_res.colors if align_res.colors is not None else col
+
     if remove_ground:
         # Optional dependency: only used when enabled.
         from dust3r.utils.custom import remove_ground as _remove_ground
@@ -126,6 +143,7 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
             pts.reshape(-1, 3),
             col.reshape(-1, 3),
             enabled=True,
+            align_ground_to_oxz=bool(align_ground_to_oxz_export),
             y_preference=str(ground_y_preference),
             coplanar_angle_tol_deg=float(ground_coplanar_angle_tol_deg),
             coplanar_offset_tol=coplanar_offset_tol,
@@ -148,6 +166,24 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
         )
         pts = res.points
         col = res.colors if res.colors is not None else col
+
+    if as_pointcloud and wall_slab:
+        from dust3r.utils.custom import wall_slab_grid_from_points as _wall_slab_grid_from_points
+
+        slab_res = _wall_slab_grid_from_points(
+            pts.reshape(-1, 3),
+            col.reshape(-1, 3),
+            align_ground=False,
+            scale_duoi=float(slab_scale_duoi),
+            scale_tren=float(slab_scale_tren),
+            strict=False,
+        )
+        pts = slab_res.slab_points
+        if slab_res.colors is not None:
+            col = slab_res.colors[slab_res.slab_mask]
+        else:
+            col = np.zeros((len(pts), 3), dtype=np.float32)
+        slab_cut_lines = slab_res.cut_lines
 
     # statistic_plane is temporarily hidden/disabled.
     # To re-enable, uncomment the block below and restore UI controls/events.
@@ -175,6 +211,8 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
     if as_pointcloud:
         pct = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
         scene.add_geometry(pct)
+        if slab_cut_lines is not None and len(slab_cut_lines) > 0:
+            scene.add_geometry(trimesh.load_path(slab_cut_lines))
     else:
         meshes = []
         for i in range(len(imgs)):
@@ -192,18 +230,23 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
                       None if transparent_cams else imgs[i], focals[i],
                       imsize=imgs[i].shape[1::-1], screen_width=cam_size)
 
-    rot = np.eye(4)
-    rot[:3, :3] = Rotation.from_euler('y', np.deg2rad(180)).as_matrix()
-    scene.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
+    preview_scene = scene.copy()
+    # Keep pointcloud preview in the exact export frame so visual slab ranges
+    # match saved GLB/PLY coordinates.
+    if not as_pointcloud:
+        rot = np.eye(4)
+        rot[:3, :3] = Rotation.from_euler('y', np.deg2rad(180)).as_matrix()
+        preview_scene.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
     # Always keep a GLB preview for the 3D widget.
     preview_glb = os.path.join(outdir, 'scene.glb')
     dl_glb = os.path.join(outdir, 'scene_download.glb') if bool(save_glb) else None
     dl_ply = os.path.join(outdir, 'scene_download.ply') if bool(save_ply) else None
     if not silent:
         print('(exporting 3D preview to', preview_glb, ')')
-    scene.export(file_obj=preview_glb)
+    preview_scene.export(file_obj=preview_glb)
 
     if dl_glb is not None:
+        # Download GLB keeps original aligned coordinates (no viewer-only transform).
         scene.export(file_obj=dl_glb)
     if dl_ply is not None:
         pct = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
@@ -216,9 +259,13 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
                             clean_depth=False, transparent_cams=False, cam_size=0.05,
                             save_glb=True,
                             save_ply=True,
+                            align_ground_to_oxz_export=True,
                             tsdf_fusion=False,
                             view_consistent_merge=False,
                             vcm_voxel_size=0.005,
+                            wall_slab=False,
+                            slab_scale_duoi=0.02,
+                            slab_scale_tren=0.18,
                             remove_ground=False,
                             ground_y_preference="low",
                             ground_coplanar_angle_tol_deg=6.0,
@@ -275,9 +322,13 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
                                         transparent_cams=transparent_cams, cam_size=cam_size, silent=silent,
                                         save_glb=save_glb,
                                         save_ply=save_ply,
+                                        align_ground_to_oxz_export=align_ground_to_oxz_export,
                                         tsdf_fusion=tsdf_fusion,
                                         view_consistent_merge=view_consistent_merge,
                                         vcm_voxel_size=vcm_voxel_size,
+                                        wall_slab=wall_slab,
+                                        slab_scale_duoi=slab_scale_duoi,
+                                        slab_scale_tren=slab_scale_tren,
                                         remove_ground=remove_ground,
                                         ground_y_preference=ground_y_preference,
                                         ground_coplanar_angle_tol_deg=ground_coplanar_angle_tol_deg,
@@ -302,9 +353,13 @@ def get_3D_model_and_downloads(*args, **kwargs):
 
 def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
                             as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size, save_glb, save_ply,
+                            align_ground_to_oxz_export,
                             tsdf_fusion,
                             view_consistent_merge,
                             vcm_voxel_size,
+                            wall_slab,
+                            slab_scale_duoi,
+                            slab_scale_tren,
                             remove_ground,
                             ground_y_preference,
                             ground_coplanar_angle_tol_deg,
@@ -342,9 +397,13 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
                                                         clean_depth, transparent_cams, cam_size,
                                                         save_glb=save_glb,
                                                         save_ply=save_ply,
+                                                        align_ground_to_oxz_export=align_ground_to_oxz_export,
                                                         tsdf_fusion=tsdf_fusion,
                                                         view_consistent_merge=view_consistent_merge,
                                                         vcm_voxel_size=vcm_voxel_size,
+                                                        wall_slab=wall_slab,
+                                                        slab_scale_duoi=slab_scale_duoi,
+                                                        slab_scale_tren=slab_scale_tren,
                                                         remove_ground=remove_ground,
                                                         ground_y_preference=ground_y_preference,
                                                         ground_coplanar_angle_tol_deg=ground_coplanar_angle_tol_deg,
@@ -427,10 +486,19 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             with gradio.Row():
                 save_glb = gradio.Checkbox(value=True, label="Enable GLB download")
                 save_ply = gradio.Checkbox(value=True, label="Enable PLY download")
+                align_ground_to_oxz_export = gradio.Checkbox(value=True, label="Align export to ground Oxz")
                 tsdf_fusion = gradio.Checkbox(value=False, label="TSDF fusion (view-based)")
                 view_consistent_merge = gradio.Checkbox(value=False, label="View-consistent merge (1 layer)")
             with gradio.Row():
                 vcm_voxel_size = gradio.Number(label="vcm_voxel_size", value=0.005, precision=6)
+            with gradio.Row():
+                wall_slab = gradio.Checkbox(value=False, label="Wall slab (low wall band)")
+                slab_scale_duoi = gradio.Slider(
+                    label="slab_scale_duoi", value=0.02, minimum=0.00, maximum=1.00, step=0.01
+                )
+                slab_scale_tren = gradio.Slider(
+                    label="slab_scale_tren", value=0.18, minimum=0.00, maximum=1.00, step=0.01
+                )
             with gradio.Row():
                 as_pointcloud = gradio.Checkbox(value=False, label="As pointcloud")
                 # two post process implemented
@@ -483,8 +551,9 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
 
             export_inputs = [
                 scene, min_conf_thr, as_pointcloud, mask_sky,
-                clean_depth, transparent_cams, cam_size, save_glb, save_ply, tsdf_fusion,
+                clean_depth, transparent_cams, cam_size, save_glb, save_ply, align_ground_to_oxz_export, tsdf_fusion,
                 view_consistent_merge, vcm_voxel_size,
+                wall_slab, slab_scale_duoi, slab_scale_tren,
                 remove_ground,
                 ground_y_preference,
                 ground_coplanar_angle_tol_deg,
@@ -506,8 +575,10 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                               outputs=[winsize, refid])
             run_btn.click(fn=recon_fun,
                       inputs=[inputfiles, schedule, niter, min_conf_thr, as_pointcloud,
-                          mask_sky, clean_depth, transparent_cams, cam_size, save_glb, save_ply, tsdf_fusion,
+                          mask_sky, clean_depth, transparent_cams, cam_size, save_glb, save_ply,
+                          align_ground_to_oxz_export, tsdf_fusion,
                           view_consistent_merge, vcm_voxel_size,
+                          wall_slab, slab_scale_duoi, slab_scale_tren,
                           remove_ground,
                           ground_y_preference,
                           ground_coplanar_angle_tol_deg,
@@ -527,6 +598,9 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             save_ply.change(fn=model_from_scene_fun,
                             inputs=export_inputs,
                             outputs=[outmodel, out_glb_file, out_ply_file])
+            align_ground_to_oxz_export.change(fn=model_from_scene_fun,
+                                              inputs=export_inputs,
+                                              outputs=[outmodel, out_glb_file, out_ply_file])
             tsdf_fusion.change(fn=model_from_scene_fun,
                                inputs=export_inputs,
                                outputs=[outmodel, out_glb_file, out_ply_file])
@@ -536,6 +610,15 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             vcm_voxel_size.change(fn=model_from_scene_fun,
                                   inputs=export_inputs,
                                   outputs=[outmodel, out_glb_file, out_ply_file])
+            wall_slab.change(fn=model_from_scene_fun,
+                         inputs=export_inputs,
+                         outputs=[outmodel, out_glb_file, out_ply_file])
+            slab_scale_duoi.release(fn=model_from_scene_fun,
+                            inputs=export_inputs,
+                            outputs=[outmodel, out_glb_file, out_ply_file])
+            slab_scale_tren.release(fn=model_from_scene_fun,
+                            inputs=export_inputs,
+                            outputs=[outmodel, out_glb_file, out_ply_file])
             as_pointcloud.change(fn=model_from_scene_fun,
                          inputs=export_inputs,
                                  outputs=[outmodel, out_glb_file, out_ply_file])
@@ -575,3 +658,4 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             # sp_robust_sigma_k.release(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
             # sp_flatten_distance_threshold.change(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
     demo.launch(share=False, server_name=server_name, server_port=server_port)
+
