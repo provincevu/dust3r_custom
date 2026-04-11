@@ -75,6 +75,11 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
                                  wall_slab=False,
                                  slab_scale_duoi=0.02,
                                  slab_scale_tren=0.18,
+                                 wall_collapse_source="all",
+                                 wall_collapse_strength=1.0,
+                                 wall_harmonize_parallel_planes=True,
+                                 wall_harmonize_parallel_tol_deg=4.0,
+                                 wall_harmonize_offset_tol_ratio=0.004,
                                  remove_ground=False,
                                  ground_y_preference="low",
                                  ground_coplanar_angle_tol_deg=6.0,
@@ -179,18 +184,24 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
             align_ground=False,
             scale_duoi=float(slab_scale_duoi),
             scale_tren=float(slab_scale_tren),
+            collapse_layers=True,
+            collapse_source=str(wall_collapse_source),
+            collapse_strength=float(wall_collapse_strength),
+            harmonize_parallel_planes=bool(wall_harmonize_parallel_planes),
+            harmonize_parallel_tol_deg=float(wall_harmonize_parallel_tol_deg),
+            harmonize_offset_tol_ratio=float(wall_harmonize_offset_tol_ratio),
             strict=False,
         )
         # Keep cloud unchanged; wall slab is used to compute/visualize cut range only.
         slab_cut_lines = slab_res.cut_lines
-        if len(slab_res.facade_band_points) > 0:
-            facade_pts = slab_res.facade_band_points
+        if len(slab_res.facade_collapsed_points) > 0:
+            facade_pts = slab_res.facade_collapsed_points
             if slab_res.colors is not None:
                 if slab_res.source_mask.shape[0] == slab_res.colors.shape[0]:
                     src_cols = slab_res.colors[slab_res.source_mask]
                 else:
                     src_cols = slab_res.colors
-                facade_col = src_cols[slab_res.facade_band_mask]
+                facade_col = src_cols
 
     # statistic_plane is temporarily hidden/disabled.
     # To re-enable, uncomment the block below and restore UI controls/events.
@@ -290,6 +301,11 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
                             wall_slab=False,
                             slab_scale_duoi=0.02,
                             slab_scale_tren=0.18,
+                            wall_collapse_source="all",
+                            wall_collapse_strength=1.0,
+                            wall_harmonize_parallel_planes=True,
+                            wall_harmonize_parallel_tol_deg=4.0,
+                            wall_harmonize_offset_tol_ratio=0.004,
                             remove_ground=False,
                             ground_y_preference="low",
                             ground_coplanar_angle_tol_deg=6.0,
@@ -353,6 +369,11 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
                                         wall_slab=wall_slab,
                                         slab_scale_duoi=slab_scale_duoi,
                                         slab_scale_tren=slab_scale_tren,
+                                        wall_collapse_source=wall_collapse_source,
+                                        wall_collapse_strength=wall_collapse_strength,
+                                        wall_harmonize_parallel_planes=wall_harmonize_parallel_planes,
+                                        wall_harmonize_parallel_tol_deg=wall_harmonize_parallel_tol_deg,
+                                        wall_harmonize_offset_tol_ratio=wall_harmonize_offset_tol_ratio,
                                         remove_ground=remove_ground,
                                         ground_y_preference=ground_y_preference,
                                         ground_coplanar_angle_tol_deg=ground_coplanar_angle_tol_deg,
@@ -384,6 +405,11 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
                             wall_slab,
                             slab_scale_duoi,
                             slab_scale_tren,
+                            wall_collapse_source,
+                            wall_collapse_strength,
+                            wall_harmonize_parallel_planes,
+                            wall_harmonize_parallel_tol_deg,
+                            wall_harmonize_offset_tol_ratio,
                             remove_ground,
                             ground_y_preference,
                             ground_coplanar_angle_tol_deg,
@@ -428,6 +454,11 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
                                                         wall_slab=wall_slab,
                                                         slab_scale_duoi=slab_scale_duoi,
                                                         slab_scale_tren=slab_scale_tren,
+                                                        wall_collapse_source=wall_collapse_source,
+                                                        wall_collapse_strength=wall_collapse_strength,
+                                                        wall_harmonize_parallel_planes=wall_harmonize_parallel_planes,
+                                                        wall_harmonize_parallel_tol_deg=wall_harmonize_parallel_tol_deg,
+                                                        wall_harmonize_offset_tol_ratio=wall_harmonize_offset_tol_ratio,
                                                         remove_ground=remove_ground,
                                                         ground_y_preference=ground_y_preference,
                                                         ground_coplanar_angle_tol_deg=ground_coplanar_angle_tol_deg,
@@ -524,6 +555,27 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                     label="slab_scale_tren", value=0.18, minimum=0.00, maximum=1.00, step=0.01
                 )
             with gradio.Row():
+                wall_collapse_source = gradio.Dropdown(
+                    ["all", "source"],
+                    value="all",
+                    label="wall_collapse_source",
+                    info="all: giữ mật độ cao (toàn cloud), source: chỉ vùng slab/source",
+                )
+                wall_collapse_strength = gradio.Slider(
+                    label="wall_collapse_strength", value=1.0, minimum=0.0, maximum=1.0, step=0.05
+                )
+            with gradio.Row():
+                wall_harmonize_parallel_planes = gradio.Checkbox(
+                    value=True,
+                    label="wall_harmonize_parallel_planes",
+                )
+                wall_harmonize_parallel_tol_deg = gradio.Slider(
+                    label="wall_harmonize_parallel_tol_deg", value=4.0, minimum=1.0, maximum=12.0, step=0.5
+                )
+                wall_harmonize_offset_tol_ratio = gradio.Slider(
+                    label="wall_harmonize_offset_tol_ratio", value=0.004, minimum=0.001, maximum=0.02, step=0.001
+                )
+            with gradio.Row():
                 as_pointcloud = gradio.Checkbox(value=True, label="As pointcloud")
                 # two post process implemented
                 mask_sky = gradio.Checkbox(value=False, label="Mask sky")
@@ -578,6 +630,8 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                 clean_depth, transparent_cams, cam_size, save_glb, save_ply, align_ground_to_oxz_export, tsdf_fusion,
                 view_consistent_merge, vcm_voxel_size,
                 wall_slab, slab_scale_duoi, slab_scale_tren,
+                wall_collapse_source, wall_collapse_strength,
+                wall_harmonize_parallel_planes, wall_harmonize_parallel_tol_deg, wall_harmonize_offset_tol_ratio,
                 remove_ground,
                 ground_y_preference,
                 ground_coplanar_angle_tol_deg,
@@ -604,6 +658,8 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                           align_ground_to_oxz_export, tsdf_fusion,
                           view_consistent_merge, vcm_voxel_size,
                           wall_slab, slab_scale_duoi, slab_scale_tren,
+                          wall_collapse_source, wall_collapse_strength,
+                          wall_harmonize_parallel_planes, wall_harmonize_parallel_tol_deg, wall_harmonize_offset_tol_ratio,
                           remove_ground,
                           ground_y_preference,
                           ground_coplanar_angle_tol_deg,
@@ -644,6 +700,21 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             slab_scale_tren.release(fn=model_from_scene_fun,
                             inputs=export_inputs,
                             outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+            wall_collapse_source.change(fn=model_from_scene_fun,
+                        inputs=export_inputs,
+                        outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+            wall_collapse_strength.release(fn=model_from_scene_fun,
+                           inputs=export_inputs,
+                           outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+            wall_harmonize_parallel_planes.change(fn=model_from_scene_fun,
+                                  inputs=export_inputs,
+                                  outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+            wall_harmonize_parallel_tol_deg.release(fn=model_from_scene_fun,
+                                    inputs=export_inputs,
+                                    outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+            wall_harmonize_offset_tol_ratio.release(fn=model_from_scene_fun,
+                                    inputs=export_inputs,
+                                    outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
             as_pointcloud.change(fn=model_from_scene_fun,
                          inputs=export_inputs,
                                  outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
@@ -683,4 +754,6 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             # sp_robust_sigma_k.release(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
             # sp_flatten_distance_threshold.change(fn=model_from_scene_fun, inputs=export_inputs, outputs=outmodel)
     demo.launch(share=False, server_name=server_name, server_port=server_port)
+
+
 

@@ -64,6 +64,10 @@ class WallSlabGridResult:
     facade_band_width: float
     facade_band_mask: np.ndarray
     facade_band_points: np.ndarray
+    facade_collapsed_points: np.ndarray
+    facade_collapse_strength: float
+    facade_collapse_source: str
+    facade_harmonized_n_adjusted: int
 
 
 def _validate_points_colors(
@@ -521,6 +525,181 @@ def distance_to_boundary_points(points_xz: np.ndarray, boundary_xz: np.ndarray) 
     return dmin
 
 
+def collapse_points_to_outer_boundary_xz(
+    points: np.ndarray,
+    boundary_xz: np.ndarray,
+    *,
+    strength: float = 1.0,
+) -> np.ndarray:
+    """Collapse multi-layers by snapping XZ toward nearest outer boundary sample.
+
+    strength=1.0 snaps fully to boundary; lower values blend with original points.
+    Y is preserved to keep vertical detail.
+    """
+    pts = np.asarray(points)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("points must be (N, 3)")
+    bnd = np.asarray(boundary_xz)
+    if bnd.ndim != 2 or (len(bnd) > 0 and bnd.shape[1] != 2):
+        raise ValueError("boundary_xz must be (M, 2)")
+
+    s = float(np.clip(strength, 0.0, 1.0))
+    if len(pts) == 0 or len(bnd) == 0 or s <= 0.0:
+        return pts.copy()
+
+    pxz = pts[:, [0, 2]].astype(np.float64)
+    nearest_idx = np.zeros((len(pxz),), dtype=np.int64)
+    nearest_dist = np.full((len(pxz),), np.inf, dtype=np.float64)
+
+    chunk = 4096
+    for i in range(0, len(bnd), chunk):
+        bb = bnd[i:i + chunk].astype(np.float64)
+        diff = pxz[:, None, :] - bb[None, :, :]
+        d2 = np.sum(diff * diff, axis=2)
+        loc_idx = np.argmin(d2, axis=1)
+        loc_d = d2[np.arange(len(pxz)), loc_idx]
+        better = loc_d < nearest_dist
+        nearest_dist[better] = loc_d[better]
+        nearest_idx[better] = i + loc_idx[better]
+
+    target_xz = bnd[nearest_idx].astype(np.float64)
+    out = pts.astype(np.float64, copy=True)
+    out[:, [0, 2]] = (1.0 - s) * pxz + s * target_xz
+    return out.astype(pts.dtype, copy=False)
+
+
+def _harmonize_parallel_near_coplanar_planes(
+    points: np.ndarray,
+    *,
+    xz_span: float,
+    enabled: bool = True,
+    distance_threshold: Optional[float] = None,
+    max_planes: int = 40,
+    min_inliers: int = 120,
+    parallel_tol_deg: float = 4.0,
+    offset_tol_ratio: float = 0.004,
+    vertical_normal_max_abs_y: float = 0.25,
+) -> Tuple[np.ndarray, int]:
+    """Snap slightly offset parallel facade planes onto a common plane.
+
+    This is conservative by design: only planes with very close offset are merged,
+    so truly distinct parallel walls are preserved.
+    """
+    pts = np.asarray(points)
+    if (not enabled) or len(pts) < int(max(50, min_inliers)):
+        return pts, 0
+
+    try:
+        import open3d as o3d  # type: ignore
+    except Exception:
+        return pts, 0
+
+    pts64 = pts.astype(np.float64)
+    dist_th = float(distance_threshold) if distance_threshold is not None else float(max(1e-5, 0.0015 * float(xz_span)))
+    offset_tol = float(max(1e-6, float(xz_span) * float(offset_tol_ratio)))
+    cos_tol = float(np.cos(np.deg2rad(float(parallel_tol_deg))))
+
+    remaining_idx = np.arange(len(pts64), dtype=np.int64)
+    planes = []
+
+    for _ in range(int(max_planes)):
+        if len(remaining_idx) < int(min_inliers):
+            break
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts64[remaining_idx])
+        plane_model, inliers_local = pcd.segment_plane(
+            distance_threshold=dist_th,
+            ransac_n=3,
+            num_iterations=1000,
+        )
+        inliers_local = np.asarray(inliers_local, dtype=np.int64)
+        if len(inliers_local) < int(min_inliers):
+            break
+
+        inliers = remaining_idx[inliers_local]
+        a, b, c, d = plane_model
+        n = np.array([a, b, c], dtype=np.float64)
+        nn = np.linalg.norm(n)
+        if nn < 1e-12:
+            remaining_idx = np.delete(remaining_idx, inliers_local)
+            continue
+        n = n / nn
+        d = float(d) / nn
+
+        # Deterministic sign for grouping stability.
+        if (n[0] < 0) or (abs(n[0]) < 1e-12 and n[2] < 0):
+            n = -n
+            d = -d
+
+        planes.append(
+            {
+                "n": n,
+                "d": d,
+                "inliers": inliers,
+                "support": int(len(inliers)),
+            }
+        )
+        remaining_idx = np.delete(remaining_idx, inliers_local)
+
+    # Keep mainly vertical facade candidates (normal mostly on XZ plane).
+    planes = [p for p in planes if abs(float(p["n"][1])) <= float(vertical_normal_max_abs_y)]
+    if len(planes) < 2:
+        return pts, 0
+
+    groups = []
+    for p in planes:
+        assigned = False
+        for g in groups:
+            ng = g["n_ref"]
+            dg = g["d_ref"]
+            n = p["n"]
+            d = p["d"]
+            if float(np.dot(n, ng)) < 0.0:
+                n = -n
+                d = -d
+            if abs(float(np.dot(n, ng))) >= cos_tol and abs(float(d - dg)) <= offset_tol:
+                g["members"].append({**p, "n": n, "d": d})
+                wsum = float(g["w_sum"] + p["support"])
+                g["n_ref"] = (g["n_ref"] * g["w_sum"] + n * p["support"]) / max(wsum, 1e-12)
+                g["n_ref"] /= max(np.linalg.norm(g["n_ref"]), 1e-12)
+                g["d_ref"] = (g["d_ref"] * g["w_sum"] + d * p["support"]) / max(wsum, 1e-12)
+                g["w_sum"] = wsum
+                assigned = True
+                break
+        if not assigned:
+            groups.append(
+                {
+                    "n_ref": p["n"].copy(),
+                    "d_ref": float(p["d"]),
+                    "w_sum": float(p["support"]),
+                    "members": [p],
+                }
+            )
+
+    out = pts64.copy()
+    n_adjusted = 0
+    for g in groups:
+        if len(g["members"]) < 2:
+            continue
+        n_ref = g["n_ref"]
+        d_ref = float(g["d_ref"])
+        proj_cap = 2.5 * offset_tol
+
+        for m in g["members"]:
+            idx = np.asarray(m["inliers"], dtype=np.int64)
+            if len(idx) == 0:
+                continue
+            s = out[idx] @ n_ref + d_ref
+            use = np.abs(s) <= proj_cap
+            if not np.any(use):
+                continue
+            sel = idx[use]
+            out[sel] = out[sel] - s[use][:, None] * n_ref[None, :]
+            n_adjusted += int(len(sel))
+
+    return out.astype(pts.dtype, copy=False), int(n_adjusted)
+
+
 def distance_to_polygon_boundary(points_xz: np.ndarray, polygon_xz: np.ndarray) -> np.ndarray:
     if len(points_xz) == 0:
         return np.zeros((0,), dtype=np.float64)
@@ -587,6 +766,13 @@ def wall_slab_grid_from_points(
     facade_band_ratio: float = 0.02,
     facade_band_ratio_min: float = 0.01,
     facade_band_ratio_max: float = 0.03,
+    collapse_layers: bool = True,
+    collapse_strength: float = 1.0,
+    collapse_source: Literal["source", "all"] = "all",
+    harmonize_parallel_planes: bool = True,
+    harmonize_parallel_tol_deg: float = 4.0,
+    harmonize_offset_tol_ratio: float = 0.004,
+    harmonize_vertical_normal_max_abs_y: float = 0.25,
     strict: bool = False,
 ) -> WallSlabGridResult:
     """Run wall-slab pipeline with outer-footprint + outer-facade band selection."""
@@ -656,6 +842,30 @@ def wall_slab_grid_from_points(
     )
     facade_band_points = source_points[facade_band_mask]
 
+    collapse_src = str(collapse_source).lower()
+    if collapse_src == "all":
+        collapse_input_points = out_pts
+    else:
+        collapse_input_points = source_points
+
+    if bool(collapse_layers):
+        facade_collapsed_points = collapse_points_to_outer_boundary_xz(
+            collapse_input_points,
+            outer_boundary_xz,
+            strength=float(collapse_strength),
+        )
+    else:
+        facade_collapsed_points = collapse_input_points.copy()
+
+    facade_collapsed_points, harmonized_n = _harmonize_parallel_near_coplanar_planes(
+        facade_collapsed_points,
+        xz_span=float(bbox.xz_span),
+        enabled=bool(harmonize_parallel_planes),
+        parallel_tol_deg=float(harmonize_parallel_tol_deg),
+        offset_tol_ratio=float(harmonize_offset_tol_ratio),
+        vertical_normal_max_abs_y=float(harmonize_vertical_normal_max_abs_y),
+    )
+
     cut_lines = build_slab_cut_lines(
         bbox.bbox_min,
         bbox.bbox_max,
@@ -683,4 +893,8 @@ def wall_slab_grid_from_points(
         facade_band_width=facade_band_width,
         facade_band_mask=facade_band_mask,
         facade_band_points=facade_band_points,
+        facade_collapsed_points=facade_collapsed_points,
+        facade_collapse_strength=float(np.clip(collapse_strength, 0.0, 1.0)),
+        facade_collapse_source=("all" if collapse_src == "all" else "source"),
+        facade_harmonized_n_adjusted=int(harmonized_n),
     )
