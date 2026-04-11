@@ -770,8 +770,8 @@ def wall_slab_grid_from_points(
     collapse_strength: float = 1.0,
     collapse_source: Literal["source", "all"] = "all",
     harmonize_parallel_planes: bool = True,
-    harmonize_parallel_tol_deg: float = 4.0,
-    harmonize_offset_tol_ratio: float = 0.004,
+    harmonize_parallel_tol_deg: float = 20.0,
+    harmonize_offset_tol_ratio: float = 0.04,
     harmonize_vertical_normal_max_abs_y: float = 0.25,
     strict: bool = False,
 ) -> WallSlabGridResult:
