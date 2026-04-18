@@ -1,9 +1,9 @@
 ![demo](assets/dust3r.jpg)
 
-Official implementation of `DUSt3R: Geometric 3D Vision Made Easy`  
+Phiên bản chính thức của `DUSt3R: Geometric 3D Vision Made Easy`  
 [[Project page](https://dust3r.europe.naverlabs.com/)], [[DUSt3R arxiv](https://arxiv.org/abs/2312.14132)]  
 
-> Make sure to also check our other works:  
+> Bạn cũng nên xem các dự án liên quan:  
 > [Grounding Image Matching in 3D with MASt3R](https://github.com/naver/mast3r): DUSt3R with a local feature head, metric pointmaps, and a more scalable global alignment!  
 > [Pow3R: Empowering Unconstrained 3D Reconstruction with Camera and Scene Priors](https://github.com/naver/pow3r): DUSt3R with known depth / focal length / poses.  
 > [MUSt3R: Multi-view Network for Stereo 3D Reconstruction](https://github.com/naver/must3r): Multi-view predictions (RGB SLAM/SfM) without any global alignment.    
@@ -30,34 +30,34 @@ Official implementation of `DUSt3R: Geometric 3D Vision Made Easy`
 }
 ```
 
-## Table of Contents
+## Mục lục
 
-- [Table of Contents](#table-of-contents)
-- [License](#license)
-- [Get Started](#get-started)
-  - [Installation](#installation)
-  - [Checkpoints](#checkpoints)
-  - [Interactive demo](#interactive-demo)
-  - [Interactive demo with docker](#interactive-demo-with-docker)
-- [Usage](#usage)
-- [Training](#training)
-  - [Datasets](#datasets)
+- [Mục lục](#mục-lục)
+- [Giấy phép](#giấy-phép)
+- [Bắt đầu](#bắt-đầu)
+  - [Cài đặt](#cài-đặt)
+  - [Checkpoint](#checkpoint)
+  - [Demo tương tác](#demo-tương-tác)
+  - [Demo tương tác với Docker](#demo-tương-tác-với-docker)
+- [Cách dùng](#cách-dùng)
+- [Huấn luyện](#huấn-luyện)
+  - [Bộ dữ liệu](#bộ-dữ-liệu)
   - [Demo](#demo)
-  - [Our Hyperparameters](#our-hyperparameters)
+  - [Siêu tham số của chúng tôi](#siêu-tham-số-của-chúng-tôi)
 
-## License
+## Giấy phép
 
-The code is distributed under the CC BY-NC-SA 4.0 License.
-See [LICENSE](LICENSE) for more information.
+Mã nguồn được phân phối theo giấy phép CC BY-NC-SA 4.0.
+Xem [LICENSE](LICENSE) để biết thêm chi tiết.
 
 ```python
 # Copyright (C) 2024-present Naver Corporation. All rights reserved.
 # Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
 ```
 
-## Get Started
+## Bắt đầu
 
-### Installation
+### Cài đặt
 
 1. Clone DUSt3R.
 ```bash
@@ -67,34 +67,34 @@ cd dust3r
 # git submodule update --init --recursive
 ```
 
-2. Create the environment, here we show an example using conda.
+2. Tạo môi trường, ở đây ví dụ dùng conda.
 ```bash
 conda create -n dust3r python=3.11 cmake=3.14.0
 conda activate dust3r 
 conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia  # use the correct version of cuda for your system
 pip install -r requirements.txt
-# Optional: you can also install additional packages to:
-# - add support for HEIC images
-# - add pyrender, used to render depthmap in some datasets preprocessing
-# - add required packages for visloc.py
+# Tùy chọn: bạn cũng có thể cài thêm các gói để:
+# - hỗ trợ ảnh HEIC
+# - thêm pyrender, dùng để render depth map trong một số bước tiền xử lý bộ dữ liệu
+# - cài các gói cần cho visloc.py
 pip install -r requirements_optional.txt
 ```
 
-3. Optional, compile the cuda kernels for RoPE (as in CroCo v2).
+3. Tùy chọn: biên dịch các CUDA kernel cho RoPE (như trong CroCo v2).
 ```bash
-# DUST3R relies on RoPE positional embeddings for which you can compile some cuda kernels for faster runtime.
+# DUSt3R dùng RoPE positional embeddings; bạn có thể biên dịch CUDA kernel để chạy nhanh hơn.
 cd croco/models/curope/
 python setup.py build_ext --inplace
 cd ../../../
 ```
 
-### Checkpoints
+### Checkpoint
 
-You can obtain the checkpoints by two ways:
+Bạn có thể lấy checkpoint theo 2 cách:
 
-1) You can use our huggingface_hub integration: the models will be downloaded automatically.
+1) Dùng tích hợp `huggingface_hub`: model sẽ được tải tự động.
 
-2) Otherwise, We provide several pre-trained models:
+2) Hoặc dùng các model pre-trained mà chúng tôi cung cấp:
 
 | Modelname   | Training resolutions | Head | Encoder | Decoder |
 |-------------|----------------------|------|---------|---------|
@@ -102,29 +102,29 @@ You can obtain the checkpoints by two ways:
 | [`DUSt3R_ViTLarge_BaseDecoder_512_linear.pth`](https://download.europe.naverlabs.com/ComputerVision/DUSt3R/DUSt3R_ViTLarge_BaseDecoder_512_linear.pth)   | 512x384, 512x336, 512x288, 512x256, 512x160 | Linear | ViT-L | ViT-B |
 | [`DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth`](https://download.europe.naverlabs.com/ComputerVision/DUSt3R/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth) | 512x384, 512x336, 512x288, 512x256, 512x160 | DPT | ViT-L | ViT-B |
 
-You can check the hyperparameters we used to train these models in the [section: Our Hyperparameters](#our-hyperparameters)
+Bạn có thể xem siêu tham số đã dùng để train các model này trong phần [Siêu tham số của chúng tôi](#siêu-tham-số-của-chúng-tôi).
 
-To download a specific model, for example `DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth`:
+Để tải một model cụ thể, ví dụ `DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth`:
 ```bash
 mkdir -p checkpoints/
 wget https://download.europe.naverlabs.com/ComputerVision/DUSt3R/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth -P checkpoints/
 ```
 
-For the checkpoints, make sure to agree to the license of all the public training datasets and base checkpoints we used, in addition to CC-BY-NC-SA 4.0. Again, see [section: Our Hyperparameters](#our-hyperparameters) for details.
+Với các checkpoint, hãy chắc chắn bạn đồng ý với giấy phép của tất cả bộ dữ liệu train công khai và các checkpoint nền chúng tôi đã dùng, bên cạnh CC-BY-NC-SA 4.0. Xem lại phần [Siêu tham số của chúng tôi](#siêu-tham-số-của-chúng-tôi) để biết thêm chi tiết.
 
-### Interactive demo
+### Demo tương tác
 
-In this demo, you should be able run DUSt3R on your machine to reconstruct a scene.
-First select images that depicts the same scene.
+Trong demo này, bạn có thể chạy DUSt3R trên máy của mình để tái tạo một cảnh.
+Trước tiên hãy chọn các ảnh thể hiện cùng một scene.
 
-You can adjust the global alignment schedule and its number of iterations.
+Bạn có thể chỉnh lịch tối ưu global alignment và số vòng lặp.
 
 > [!NOTE]
-> If you selected one or two images, the global alignment procedure will be skipped (mode=GlobalAlignerMode.PairViewer)
+> Nếu bạn chỉ chọn 1 hoặc 2 ảnh, bước global alignment sẽ bị bỏ qua (mode=GlobalAlignerMode.PairViewer)
 
-Hit "Run" and wait.
-When the global alignment ends, the reconstruction appears.
-Use the slider "min_conf_thr" to show or remove low confidence areas.
+Bấm "Run" và chờ.
+Khi global alignment kết thúc, kết quả reconstruction sẽ xuất hiện.
+Dùng slider "min_conf_thr" để hiện hoặc ẩn các vùng có độ tin cậy thấp.
 
 ```bash
 python3 demo.py --model_name DUSt3R_ViTLarge_BaseDecoder_512_dpt
@@ -136,37 +136,37 @@ python3 demo.py --model_name DUSt3R_ViTLarge_BaseDecoder_512_dpt
 # Use --device to use a different device, by default it's "cuda"
 ```
 
-### Interactive demo with docker
+### Demo tương tác với Docker
 
-To run DUSt3R using Docker, including with NVIDIA CUDA support, follow these instructions:
+Để chạy DUSt3R bằng Docker, bao gồm hỗ trợ NVIDIA CUDA, làm theo các bước sau:
 
-1. **Install Docker**: If not already installed, download and install `docker` and `docker compose` from the [Docker website](https://www.docker.com/get-started).
+1. **Cài Docker**: nếu chưa có, tải và cài `docker` và `docker compose` từ [trang Docker](https://www.docker.com/get-started).
 
-2. **Install NVIDIA Docker Toolkit**: For GPU support, install the NVIDIA Docker toolkit from the [Nvidia website](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+2. **Cài NVIDIA Docker Toolkit**: để dùng GPU, cài NVIDIA Docker toolkit từ [trang Nvidia](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
-3. **Build the Docker image and run it**: `cd` into the `./docker` directory and run the following commands: 
+3. **Build image Docker và chạy**: `cd` vào thư mục `./docker` và chạy các lệnh sau: 
 
 ```bash
 cd docker
 bash run.sh --with-cuda --model_name="DUSt3R_ViTLarge_BaseDecoder_512_dpt"
 ```
 
-Or if you want to run the demo without CUDA support, run the following command:
+Hoặc nếu bạn muốn chạy demo không dùng CUDA, chạy lệnh sau:
 
 ```bash 
 cd docker
 bash run.sh --model_name="DUSt3R_ViTLarge_BaseDecoder_512_dpt"
 ```
 
-By default, `demo.py` is lanched with the option `--local_network`.  
-Visit `http://localhost:7860/` to access the web UI (or replace `localhost` with the machine's name to access it from the network).  
+Mặc định, `demo.py` được khởi chạy với tùy chọn `--local_network`.  
+Truy cập `http://localhost:7860/` để mở giao diện web (hoặc thay `localhost` bằng tên máy để truy cập qua mạng).  
 
-`run.sh` will launch docker-compose using either the [docker-compose-cuda.yml](docker/docker-compose-cuda.yml) or [docker-compose-cpu.ym](docker/docker-compose-cpu.yml) config file, then it starts the demo using [entrypoint.sh](docker/files/entrypoint.sh).
+`run.sh` sẽ chạy docker-compose bằng file cấu hình [docker-compose-cuda.yml](docker/docker-compose-cuda.yml) hoặc [docker-compose-cpu.ym](docker/docker-compose-cpu.yml), sau đó khởi động demo bằng [entrypoint.sh](docker/files/entrypoint.sh).
 
 
 ![demo](assets/demo.jpg)
 
-## Usage
+## Cách dùng
 
 ```python
 from dust3r.inference import inference
@@ -190,38 +190,38 @@ if __name__ == '__main__':
     pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
     output = inference(pairs, model, device, batch_size=batch_size)
 
-    # at this stage, you have the raw dust3r predictions
+    # ở bước này, bạn đã có dự đoán thô của DUSt3R
     view1, pred1 = output['view1'], output['pred1']
     view2, pred2 = output['view2'], output['pred2']
-    # here, view1, pred1, view2, pred2 are dicts of lists of len(2)
-    #  -> because we symmetrize we have (im1, im2) and (im2, im1) pairs
-    # in each view you have:
-    # an integer image identifier: view1['idx'] and view2['idx']
-    # the img: view1['img'] and view2['img']
-    # the image shape: view1['true_shape'] and view2['true_shape']
-    # an instance string output by the dataloader: view1['instance'] and view2['instance']
-    # pred1 and pred2 contains the confidence values: pred1['conf'] and pred2['conf']
-    # pred1 contains 3D points for view1['img'] in view1['img'] space: pred1['pts3d']
-    # pred2 contains 3D points for view2['img'] in view1['img'] space: pred2['pts3d_in_other_view']
+    # ở đây view1, pred1, view2, pred2 là dict chứa list có độ dài 2
+    #  -> vì ta symmetrize nên có cặp (im1, im2) và (im2, im1)
+    # trong mỗi view có:
+    # id ảnh dạng số: view1['idx'] và view2['idx']
+    # ảnh: view1['img'] và view2['img']
+    # kích thước ảnh: view1['true_shape'] và view2['true_shape']
+    # chuỗi instance do dataloader xuất ra: view1['instance'] và view2['instance']
+    # pred1 và pred2 chứa confidence: pred1['conf'] và pred2['conf']
+    # pred1 chứa điểm 3D cho view1['img'] trong hệ tọa độ của view1['img']: pred1['pts3d']
+    # pred2 chứa điểm 3D cho view2['img'] trong hệ tọa độ của view1['img']: pred2['pts3d_in_other_view']
 
-    # next we'll use the global_aligner to align the predictions
-    # depending on your task, you may be fine with the raw output and not need it
-    # with only two input images, you could use GlobalAlignerMode.PairViewer: it would just convert the output
-    # if using GlobalAlignerMode.PairViewer, no need to run compute_global_alignment
+    # tiếp theo ta dùng global_aligner để căn chỉnh dự đoán
+    # tùy bài toán, bạn có thể chỉ cần output thô và không cần bước này
+    # nếu chỉ có 2 ảnh đầu vào, bạn có thể dùng GlobalAlignerMode.PairViewer: nó chỉ chuyển đổi output
+    # nếu dùng GlobalAlignerMode.PairViewer, không cần chạy compute_global_alignment
     scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer)
     loss = scene.compute_global_alignment(init="mst", niter=niter, schedule=schedule, lr=lr)
 
-    # retrieve useful values from scene:
+    # lấy các giá trị hữu ích từ scene:
     imgs = scene.imgs
     focals = scene.get_focals()
     poses = scene.get_im_poses()
     pts3d = scene.get_pts3d()
     confidence_masks = scene.get_masks()
 
-    # visualize reconstruction
+    # trực quan hóa reconstruction
     scene.show()
 
-    # find 2D-2D matches between the two images
+    # tìm match 2D-2D giữa hai ảnh
     from dust3r.utils.geometry import find_reciprocal_matches, xy_grid
     pts2d_list, pts3d_list = [], []
     for i in range(2):
@@ -233,7 +233,7 @@ if __name__ == '__main__':
     matches_im1 = pts2d_list[1][reciprocal_in_P2]
     matches_im0 = pts2d_list[0][nn2_in_P1][reciprocal_in_P2]
 
-    # visualize a few matches
+    # trực quan hóa vài match
     import numpy as np
     from matplotlib import pyplot as pl
     n_viz = 10
@@ -255,12 +255,12 @@ if __name__ == '__main__':
 ```
 ![matching example on croco pair](assets/matching.jpg)
 
-## Training
+## Huấn luyện
 
-In this section, we present a short demonstration to get started with training DUSt3R.
+Phần này trình bày một demo ngắn để bắt đầu huấn luyện DUSt3R.
 
-### Datasets
-At this moment, we have added the following training datasets:
+### Bộ dữ liệu
+Hiện tại, chúng tôi đã hỗ trợ các bộ dữ liệu train sau:
   - [CO3Dv2](https://github.com/facebookresearch/co3d) - [Creative Commons Attribution-NonCommercial 4.0 International](https://github.com/facebookresearch/co3d/blob/main/LICENSE)
   - [ARKitScenes](https://github.com/apple/ARKitScenes) - [Creative Commons Attribution-NonCommercial-ShareAlike 4.0](https://github.com/apple/ARKitScenes/tree/main?tab=readme-ov-file#license)
   - [ScanNet++](https://kaldir.vc.in.tum.de/scannetpp/) - [non-commercial research and educational purposes](https://kaldir.vc.in.tum.de/scannetpp/static/scannetpp-terms-of-use.pdf)
@@ -271,8 +271,8 @@ At this moment, we have added the following training datasets:
   - [StaticThings3D](https://github.com/lmb-freiburg/robustmvd/blob/master/rmvd/data/README.md#staticthings3d)
   - [WildRGB-D](https://github.com/wildrgbd/wildrgbd/)
 
-For each dataset, we provide a preprocessing script in the `datasets_preprocess` directory and an archive containing the list of pairs when needed.
-You have to download the datasets yourself from their official sources, agree to their license, download our list of pairs, and run the preprocessing script.
+Với mỗi bộ dữ liệu, chúng tôi cung cấp script tiền xử lý trong thư mục `datasets_preprocess` và một gói chứa danh sách cặp ảnh khi cần.
+Bạn cần tự tải dữ liệu từ nguồn chính thức, chấp nhận giấy phép của họ, tải danh sách cặp ảnh của chúng tôi và chạy script tiền xử lý.
 
 Links:  
   
@@ -286,12 +286,12 @@ Links:
 [StaticThings3D pairs](https://download.europe.naverlabs.com/ComputerVision/DUSt3R/staticthings_pairs.npy)  
 
 > [!NOTE]
-> They are not strictly equivalent to what was used to train DUSt3R, but they should be close enough.
+> Chúng không hoàn toàn giống 100% với dữ liệu đã dùng để train DUSt3R, nhưng đủ gần.
 
 ### Demo
-For this training demo, we're going to download and prepare a subset of [CO3Dv2](https://github.com/facebookresearch/co3d) - [Creative Commons Attribution-NonCommercial 4.0 International](https://github.com/facebookresearch/co3d/blob/main/LICENSE) and launch the training code on it.
-The demo model will be trained for a few epochs on a very small dataset.
-It will not be very good.
+Trong demo huấn luyện này, chúng ta sẽ tải và chuẩn bị một phần nhỏ của [CO3Dv2](https://github.com/facebookresearch/co3d) - [Creative Commons Attribution-NonCommercial 4.0 International](https://github.com/facebookresearch/co3d/blob/main/LICENSE) rồi chạy mã train trên đó.
+Model demo sẽ chỉ train vài epoch trên một dataset rất nhỏ.
+Kết quả sẽ không tốt.
 
 ```bash
 # download and prepare the co3d subset
@@ -309,9 +309,9 @@ python3 datasets_preprocess/preprocess_co3d.py --co3d_dir data/co3d_subset --out
 mkdir -p checkpoints/
 wget https://download.europe.naverlabs.com/ComputerVision/CroCo/CroCo_V2_ViTLarge_BaseDecoder.pth -P checkpoints/
 
-# the training of dust3r is done in 3 steps.
-# for this example we'll do fewer epochs, for the actual hyperparameters we used in the paper, see the next section: "Our Hyperparameters"
-# step 1 - train dust3r for 224 resolution
+# quá trình train DUSt3R được thực hiện trong 3 bước.
+# trong ví dụ này ta train ít epoch hơn; để xem siêu tham số thật đã dùng trong paper, xem phần tiếp theo: "Siêu tham số của chúng tôi"
+# bước 1 - train DUSt3R ở độ phân giải 224
 torchrun --nproc_per_node=4 train.py \
     --train_dataset "1000 @ Co3d(split='train', ROOT='data/co3d_subset_processed', aug_crop=16, mask_bg='rand', resolution=224, transform=ColorJitter)" \
     --test_dataset "100 @ Co3d(split='test', ROOT='data/co3d_subset_processed', resolution=224, seed=777)" \
@@ -323,7 +323,7 @@ torchrun --nproc_per_node=4 train.py \
     --save_freq 1 --keep_freq 5 --eval_freq 1 \
     --output_dir "checkpoints/dust3r_demo_224"	  
 
-# step 2 - train dust3r for 512 resolution
+# bước 2 - train DUSt3R ở độ phân giải 512
 torchrun --nproc_per_node=4 train.py \
     --train_dataset "1000 @ Co3d(split='train', ROOT='data/co3d_subset_processed', aug_crop=16, mask_bg='rand', resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)" \
     --test_dataset "100 @ Co3d(split='test', ROOT='data/co3d_subset_processed', resolution=(512,384), seed=777)" \
@@ -335,7 +335,7 @@ torchrun --nproc_per_node=4 train.py \
     --save_freq 1 --keep_freq 5 --eval_freq 1 \
     --output_dir "checkpoints/dust3r_demo_512"
 
-# step 3 - train dust3r for 512 resolution with dpt
+# bước 3 - train DUSt3R ở độ phân giải 512 với dpt
 torchrun --nproc_per_node=4 train.py \
     --train_dataset "1000 @ Co3d(split='train', ROOT='data/co3d_subset_processed', aug_crop=16, mask_bg='rand', resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 160)], transform=ColorJitter)" \
     --test_dataset "100 @ Co3d(split='test', ROOT='data/co3d_subset_processed', resolution=(512,384), seed=777)" \
@@ -349,9 +349,9 @@ torchrun --nproc_per_node=4 train.py \
 
 ```
 
-### Our Hyperparameters
+### Siêu tham số của chúng tôi
 
-Here are the commands we used for training the models:
+Đây là các lệnh chúng tôi đã dùng để train các model:
 
 ```bash
 # NOTE: ROOT path omitted for datasets

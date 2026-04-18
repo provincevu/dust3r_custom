@@ -45,6 +45,7 @@ def to_cuda(x): return todevice(x, 'cuda')
 
 
 def collate_with_cat(whatever, lists=False):
+    # hàm này để collate (gom lại thành 1 batch) có thể là dict, list, tuple, tensor, numpy array, hoặc các kiểu hỗn hợp
     if isinstance(whatever, dict):
         return {k: collate_with_cat(vals, lists=lists) for k, vals in whatever.items()}
 

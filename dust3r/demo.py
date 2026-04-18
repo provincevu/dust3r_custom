@@ -13,6 +13,7 @@ import os
 import torch
 import numpy as np
 import functools
+import importlib
 import trimesh
 import copy
 from scipy.spatial.transform import Rotation
@@ -72,6 +73,11 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
                                  tsdf_fusion=False,
                                  view_consistent_merge=False,
                                  vcm_voxel_size=0.005,
+                                 thin_shell_collapse=False,
+                                 thin_shell_seed_stride=6,
+                                 thin_shell_normal_radius_mult=4.0,
+                                 thin_shell_cluster_gap_mult=1.5,
+                                 thin_shell_layer_select_mode="propagate",
                                  wall_slab=False,
                                  slab_scale_duoi=0.02,
                                  slab_scale_tren=0.18,
@@ -175,33 +181,35 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
         pts = res.points
         col = res.colors if res.colors is not None else col
 
-    if as_pointcloud and wall_slab:
-        from dust3r.utils.custom import wall_slab_grid_from_points as _wall_slab_grid_from_points
+    if as_pointcloud and thin_shell_collapse:
+        # Optional plugin-like step; if module is removed, we skip safely.
+        try:
+            mod = importlib.import_module("dust3r.utils.custom.thin_shell_collapse")
+            _thin_shell_collapse = getattr(mod, "thin_shell_collapse")
+            res = _thin_shell_collapse(
+                pts.reshape(-1, 3),
+                col.reshape(-1, 3),
+                enabled=True,
+                seed_stride=int(thin_shell_seed_stride),
+                normal_radius_mult=float(thin_shell_normal_radius_mult),
+                cluster_gap_mult=float(thin_shell_cluster_gap_mult),
+                layer_select_mode=str(thin_shell_layer_select_mode),
+            )
+            pts = res.points
+            col = res.colors if res.colors is not None else col
+            if not silent:
+                print(
+                    f"[thin_shell] kept {len(pts)}/{res.n_input} seeds, "
+                    f"spacing={res.spacing:.6f}, r_n={res.normal_radius:.6f}"
+                )
+        except Exception as e:
+            if not silent:
+                print(f"[thin_shell] skipped ({e})")
 
-        slab_res = _wall_slab_grid_from_points(
-            pts.reshape(-1, 3),
-            col.reshape(-1, 3),
-            align_ground=False,
-            scale_duoi=float(slab_scale_duoi),
-            scale_tren=float(slab_scale_tren),
-            collapse_layers=True,
-            collapse_source=str(wall_collapse_source),
-            collapse_strength=float(wall_collapse_strength),
-            harmonize_parallel_planes=bool(wall_harmonize_parallel_planes),
-            harmonize_parallel_tol_deg=float(wall_harmonize_parallel_tol_deg),
-            harmonize_offset_tol_ratio=float(wall_harmonize_offset_tol_ratio),
-            strict=False,
-        )
-        # Keep cloud unchanged; wall slab is used to compute/visualize cut range only.
-        slab_cut_lines = slab_res.cut_lines
-        if len(slab_res.facade_collapsed_points) > 0:
-            facade_pts = slab_res.facade_collapsed_points
-            if slab_res.colors is not None:
-                if slab_res.source_mask.shape[0] == slab_res.colors.shape[0]:
-                    src_cols = slab_res.colors[slab_res.source_mask]
-                else:
-                    src_cols = slab_res.colors
-                facade_col = src_cols
+    # wall_slab feature removed: no processing performed here
+    slab_cut_lines = None
+    facade_pts = None
+    facade_col = None
 
     # statistic_plane is temporarily hidden/disabled.
     # To re-enable, uncomment the block below and restore UI controls/events.
@@ -257,28 +265,14 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
         preview_scene.apply_transform(np.linalg.inv(cams2world[0] @ OPENGL @ rot))
     # Always keep a GLB preview for the 3D widget.
     preview_glb = os.path.join(outdir, 'scene.glb')
-    facade_preview_glb = os.path.join(outdir, 'scene_facade.glb') if (as_pointcloud and wall_slab and facade_pts is not None and len(facade_pts) > 0) else None
+    facade_preview_glb = None
     dl_glb = os.path.join(outdir, 'scene_download.glb') if bool(save_glb) else None
     dl_ply = os.path.join(outdir, 'scene_download.ply') if bool(save_ply) else None
     if not silent:
         print('(exporting 3D preview to', preview_glb, ')')
     preview_scene.export(file_obj=preview_glb)
 
-    if facade_preview_glb is not None:
-        facade_scene = trimesh.Scene()
-        fc = facade_col if facade_col is not None else np.zeros((len(facade_pts), 3), dtype=np.float32)
-        facade_scene.add_geometry(trimesh.PointCloud(facade_pts.reshape(-1, 3), colors=fc.reshape(-1, 3)))
-        if slab_cut_lines is not None and len(slab_cut_lines) > 0:
-            facade_scene.add_geometry(trimesh.load_path(slab_cut_lines))
-        for i, pose_c2w in enumerate(cams2world):
-            if isinstance(cam_color, list):
-                camera_edge_color = cam_color[i]
-            else:
-                camera_edge_color = cam_color or CAM_COLORS[i % len(CAM_COLORS)]
-            add_scene_cam(facade_scene, pose_c2w, camera_edge_color,
-                          None if transparent_cams else imgs[i], focals[i],
-                          imsize=imgs[i].shape[1::-1], screen_width=cam_size)
-        facade_scene.export(file_obj=facade_preview_glb)
+    # facade preview disabled (wall_slab removed)
 
     if dl_glb is not None:
         # Download GLB keeps original aligned coordinates (no viewer-only transform).
@@ -287,7 +281,8 @@ def _convert_scene_output_to_glb(outdir, imgs, pts3d, mask, focals, cams2world, 
         pct = trimesh.PointCloud(pts.reshape(-1, 3), colors=col.reshape(-1, 3))
         pct.export(file_obj=dl_ply)
 
-    return preview_glb, facade_preview_glb, dl_glb, dl_ply
+    # facade preview removed: return only preview (for Model3D) and downloadable files
+    return preview_glb, dl_glb, dl_ply
 
 
 def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud=False, mask_sky=False,
@@ -298,6 +293,11 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
                             tsdf_fusion=False,
                             view_consistent_merge=False,
                             vcm_voxel_size=0.005,
+                            thin_shell_collapse=False,
+                            thin_shell_seed_stride=6,
+                            thin_shell_normal_radius_mult=4.0,
+                            thin_shell_cluster_gap_mult=1.5,
+                            thin_shell_layer_select_mode="propagate",
                             wall_slab=False,
                             slab_scale_duoi=0.02,
                             slab_scale_tren=0.18,
@@ -323,7 +323,8 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
     extract 3D_model (glb file) from a reconstructed scene
     """
     if scene is None:
-        return None, None, None, None
+        # previously returned 4 values (including facade preview); now return 3 to match outputs
+        return None, None, None
     # post processes
     if clean_depth:
         scene = scene.clean_pointcloud()
@@ -366,6 +367,11 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
                                         tsdf_fusion=tsdf_fusion,
                                         view_consistent_merge=view_consistent_merge,
                                         vcm_voxel_size=vcm_voxel_size,
+                                        thin_shell_collapse=thin_shell_collapse,
+                                        thin_shell_seed_stride=thin_shell_seed_stride,
+                                        thin_shell_normal_radius_mult=thin_shell_normal_radius_mult,
+                                        thin_shell_cluster_gap_mult=thin_shell_cluster_gap_mult,
+                                        thin_shell_layer_select_mode=thin_shell_layer_select_mode,
                                         wall_slab=wall_slab,
                                         slab_scale_duoi=slab_scale_duoi,
                                         slab_scale_tren=slab_scale_tren,
@@ -391,9 +397,53 @@ def get_3D_model_from_scene(outdir, silent, scene, min_conf_thr=3, as_pointcloud
                                         precomputed_colors=pre_col)
 
 
-def get_3D_model_and_downloads(*args, **kwargs):
-    preview_glb, facade_preview_glb, dl_glb, dl_ply = get_3D_model_from_scene(*args, **kwargs)
-    return preview_glb, (facade_preview_glb or preview_glb), dl_glb, dl_ply
+def get_3D_model_and_downloads(outdir, silent, scene, min_conf_thr=3, as_pointcloud=False, mask_sky=False,
+                               clean_depth=False, transparent_cams=False, cam_size=0.05,
+                               save_glb=True, save_ply=True,
+                               align_ground_to_oxz_export=True,
+                               tsdf_fusion=False,
+                               view_consistent_merge=False,
+                               vcm_voxel_size=0.005,
+                               thin_shell_collapse=False,
+                               thin_shell_seed_stride=6,
+                               thin_shell_normal_radius_mult=4.0,
+                               thin_shell_cluster_gap_mult=1.5,
+                               thin_shell_layer_select_mode="propagate",
+                               remove_ground=False,
+                               ground_y_preference="low",
+                               ground_coplanar_angle_tol_deg=6.0,
+                               ground_coplanar_offset_tol=-1.0,
+                               remove_outlier_cc=False):
+    # Pass by keyword to avoid positional drift with legacy wall_* args still present
+    # in get_3D_model_from_scene signature.
+    preview_glb, dl_glb, dl_ply = get_3D_model_from_scene(
+        outdir=outdir,
+        silent=silent,
+        scene=scene,
+        min_conf_thr=min_conf_thr,
+        as_pointcloud=as_pointcloud,
+        mask_sky=mask_sky,
+        clean_depth=clean_depth,
+        transparent_cams=transparent_cams,
+        cam_size=cam_size,
+        save_glb=save_glb,
+        save_ply=save_ply,
+        align_ground_to_oxz_export=align_ground_to_oxz_export,
+        tsdf_fusion=tsdf_fusion,
+        view_consistent_merge=view_consistent_merge,
+        vcm_voxel_size=vcm_voxel_size,
+        thin_shell_collapse=thin_shell_collapse,
+        thin_shell_seed_stride=thin_shell_seed_stride,
+        thin_shell_normal_radius_mult=thin_shell_normal_radius_mult,
+        thin_shell_cluster_gap_mult=thin_shell_cluster_gap_mult,
+        thin_shell_layer_select_mode=thin_shell_layer_select_mode,
+        remove_ground=remove_ground,
+        ground_y_preference=ground_y_preference,
+        ground_coplanar_angle_tol_deg=ground_coplanar_angle_tol_deg,
+        ground_coplanar_offset_tol=ground_coplanar_offset_tol,
+        remove_outlier_cc=remove_outlier_cc,
+    )
+    return preview_glb, dl_glb, dl_ply
 
 
 def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist, schedule, niter, min_conf_thr,
@@ -402,14 +452,11 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
                             tsdf_fusion,
                             view_consistent_merge,
                             vcm_voxel_size,
-                            wall_slab,
-                            slab_scale_duoi,
-                            slab_scale_tren,
-                            wall_collapse_source,
-                            wall_collapse_strength,
-                            wall_harmonize_parallel_planes,
-                            wall_harmonize_parallel_tol_deg,
-                            wall_harmonize_offset_tol_ratio,
+                            thin_shell_collapse,
+                            thin_shell_seed_stride,
+                            thin_shell_normal_radius_mult,
+                            thin_shell_cluster_gap_mult,
+                            thin_shell_layer_select_mode,
                             remove_ground,
                             ground_y_preference,
                             ground_coplanar_angle_tol_deg,
@@ -443,27 +490,33 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
     if mode == GlobalAlignerMode.PointCloudOptimizer:
         loss = scene.compute_global_alignment(init='mst', niter=niter, schedule=schedule, lr=lr)
 
-    outfile, facade_outfile, glbfile, plyfile = get_3D_model_from_scene(outdir, silent, scene, min_conf_thr, as_pointcloud, mask_sky,
-                                                        clean_depth, transparent_cams, cam_size,
-                                                        save_glb=save_glb,
-                                                        save_ply=save_ply,
-                                                        align_ground_to_oxz_export=align_ground_to_oxz_export,
-                                                        tsdf_fusion=tsdf_fusion,
-                                                        view_consistent_merge=view_consistent_merge,
-                                                        vcm_voxel_size=vcm_voxel_size,
-                                                        wall_slab=wall_slab,
-                                                        slab_scale_duoi=slab_scale_duoi,
-                                                        slab_scale_tren=slab_scale_tren,
-                                                        wall_collapse_source=wall_collapse_source,
-                                                        wall_collapse_strength=wall_collapse_strength,
-                                                        wall_harmonize_parallel_planes=wall_harmonize_parallel_planes,
-                                                        wall_harmonize_parallel_tol_deg=wall_harmonize_parallel_tol_deg,
-                                                        wall_harmonize_offset_tol_ratio=wall_harmonize_offset_tol_ratio,
-                                                        remove_ground=remove_ground,
-                                                        ground_y_preference=ground_y_preference,
-                                                        ground_coplanar_angle_tol_deg=ground_coplanar_angle_tol_deg,
-                                                        ground_coplanar_offset_tol=ground_coplanar_offset_tol,
-                                                        remove_outlier_cc=remove_outlier_cc)
+    outfile, glbfile, plyfile = get_3D_model_from_scene(
+        outdir,
+        silent,
+        scene,
+        min_conf_thr,
+        as_pointcloud,
+        mask_sky,
+        clean_depth,
+        transparent_cams,
+        cam_size,
+        save_glb=save_glb,
+        save_ply=save_ply,
+        align_ground_to_oxz_export=align_ground_to_oxz_export,
+        tsdf_fusion=tsdf_fusion,
+        view_consistent_merge=view_consistent_merge,
+        vcm_voxel_size=vcm_voxel_size,
+        thin_shell_collapse=thin_shell_collapse,
+        thin_shell_seed_stride=thin_shell_seed_stride,
+        thin_shell_normal_radius_mult=thin_shell_normal_radius_mult,
+        thin_shell_cluster_gap_mult=thin_shell_cluster_gap_mult,
+        thin_shell_layer_select_mode=thin_shell_layer_select_mode,
+        remove_ground=remove_ground,
+        ground_y_preference=ground_y_preference,
+        ground_coplanar_angle_tol_deg=ground_coplanar_angle_tol_deg,
+        ground_coplanar_offset_tol=ground_coplanar_offset_tol,
+        remove_outlier_cc=remove_outlier_cc,
+    )
 
     # also return rgb, depth and confidence imgs
     # depth is normalized with the max value for all images
@@ -483,7 +536,32 @@ def get_reconstructed_scene(outdir, model, device, silent, image_size, filelist,
         imgs.append(rgb(depths[i]))
         imgs.append(rgb(confs[i]))
 
-    return scene, outfile, facade_outfile, imgs, glbfile, plyfile
+    # return scene state, preview for 3D widget, gallery images, and download files
+    return scene, outfile, imgs, glbfile, plyfile
+
+
+def _normalize_recon_outputs(outputs):
+    """Normalize legacy/new reconstruction outputs to exactly 5 Gradio outputs.
+
+    Expected normalized order:
+    (scene_state, preview_model_path, gallery_images, glb_download_path, ply_download_path)
+    """
+    if isinstance(outputs, tuple):
+        values = list(outputs)
+    elif isinstance(outputs, list):
+        values = outputs
+    else:
+        raise TypeError(f"Unexpected reconstruction output type: {type(outputs)!r}")
+
+    if len(values) == 5:
+        return tuple(values)
+
+    # Legacy format had a removed facade preview value at index 2:
+    # (scene, preview_model, facade_preview, gallery, glb, ply)
+    if len(values) == 6:
+        return values[0], values[1], values[3], values[4], values[5]
+
+    raise ValueError(f"Unexpected number of reconstruction outputs: {len(values)}")
 
 
 def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
@@ -509,6 +587,10 @@ def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
 
 def main_demo(tmpdirname, model, device, image_size, server_name, server_port, silent=False):
     recon_fun = functools.partial(get_reconstructed_scene, tmpdirname, model, device, silent, image_size)
+
+    def recon_fun_safe(*args):
+        return _normalize_recon_outputs(recon_fun(*args))
+
     model_from_scene_fun = functools.partial(get_3D_model_and_downloads, tmpdirname, silent)
     with gradio.Blocks(css=""".gradio-container {margin: 0 !important; min-width: 100%};""", title="DUSt3R Demo") as demo:
         # scene state is save so that you can change conf_thr, cam_size... without rerunning the inference
@@ -535,7 +617,7 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
 
             with gradio.Row():
                 # adjust the confidence threshold
-                min_conf_thr = gradio.Slider(label="min_conf_thr", value=13.0, minimum=1.0, maximum=100, step=0.1)
+                min_conf_thr = gradio.Slider(label="min_conf_thr", value=13.0, minimum=1.0, maximum=20, step=0.1)
                 # adjust the camera size in the output pointcloud
                 cam_size = gradio.Slider(label="cam_size", value=0.001, minimum=0.001, maximum=0.1, step=0.001)
             with gradio.Row():
@@ -547,34 +629,26 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             with gradio.Row():
                 vcm_voxel_size = gradio.Number(label="vcm_voxel_size", value=0.005, precision=6)
             with gradio.Row():
-                wall_slab = gradio.Checkbox(value=False, label="Wall slab (low wall band)")
-                slab_scale_duoi = gradio.Slider(
-                    label="slab_scale_duoi", value=0.02, minimum=0.00, maximum=1.00, step=0.01
+                thin_shell_collapse = gradio.Checkbox(
+                    value=False,
+                    label="Thin-shell collapse (~1 layer, seed-based)",
                 )
-                slab_scale_tren = gradio.Slider(
-                    label="slab_scale_tren", value=0.18, minimum=0.00, maximum=1.00, step=0.01
+                thin_shell_seed_stride = gradio.Number(
+                    label="thin_shell_seed_stride", value=6, precision=0, minimum=1, maximum=128
                 )
-            with gradio.Row():
-                wall_collapse_source = gradio.Dropdown(
-                    ["all", "source"],
-                    value="all",
-                    label="wall_collapse_source",
-                    info="all: giữ mật độ cao (toàn cloud), source: chỉ vùng slab/source",
+                thin_shell_normal_radius_mult = gradio.Number(
+                    label="thin_shell_normal_radius_mult", value=4.0, precision=3
                 )
-                wall_collapse_strength = gradio.Slider(
-                    label="wall_collapse_strength", value=1.0, minimum=0.0, maximum=1.0, step=0.05
+                thin_shell_cluster_gap_mult = gradio.Number(
+                    label="thin_shell_cluster_gap_mult", value=1.5, precision=3
                 )
-            with gradio.Row():
-                wall_harmonize_parallel_planes = gradio.Checkbox(
-                    value=True,
-                    label="wall_harmonize_parallel_planes",
+                thin_shell_layer_select_mode = gradio.Dropdown(
+                    ["propagate", "roughness"],
+                    value="propagate",
+                    label="thin_shell_layer_select_mode",
+                    info="propagate: giữ liên tục 1 nhánh; roughness: chọn độc lập từng seed",
                 )
-                wall_harmonize_parallel_tol_deg = gradio.Slider(
-                    label="wall_harmonize_parallel_tol_deg", value=4.0, minimum=1.0, maximum=12.0, step=0.5
-                )
-                wall_harmonize_offset_tol_ratio = gradio.Slider(
-                    label="wall_harmonize_offset_tol_ratio", value=0.004, minimum=0.001, maximum=0.02, step=0.001
-                )
+            # wall_slab UI removed
             with gradio.Row():
                 as_pointcloud = gradio.Checkbox(value=True, label="As pointcloud")
                 # two post process implemented
@@ -629,9 +703,11 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                 scene, min_conf_thr, as_pointcloud, mask_sky,
                 clean_depth, transparent_cams, cam_size, save_glb, save_ply, align_ground_to_oxz_export, tsdf_fusion,
                 view_consistent_merge, vcm_voxel_size,
-                wall_slab, slab_scale_duoi, slab_scale_tren,
-                wall_collapse_source, wall_collapse_strength,
-                wall_harmonize_parallel_planes, wall_harmonize_parallel_tol_deg, wall_harmonize_offset_tol_ratio,
+                thin_shell_collapse,
+                thin_shell_seed_stride,
+                thin_shell_normal_radius_mult,
+                thin_shell_cluster_gap_mult,
+                thin_shell_layer_select_mode,
                 remove_ground,
                 ground_y_preference,
                 ground_coplanar_angle_tol_deg,
@@ -640,7 +716,6 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             ]
 
             outmodel = gradio.Model3D()
-            outmodel_facade = gradio.Model3D(label="Facade Band Preview (Multi-layer Reduced)")
             outgallery = gradio.Gallery(label='rgb,depth,confidence', columns=3, height="100%")
             out_glb_file = gradio.File(label="Download scene.glb")
             out_ply_file = gradio.File(label="Download scene.ply")
@@ -652,96 +727,107 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
             inputfiles.change(set_scenegraph_options,
                               inputs=[inputfiles, winsize, refid, scenegraph_type],
                               outputs=[winsize, refid])
-            run_btn.click(fn=recon_fun,
-                      inputs=[inputfiles, schedule, niter, min_conf_thr, as_pointcloud,
-                          mask_sky, clean_depth, transparent_cams, cam_size, save_glb, save_ply,
-                          align_ground_to_oxz_export, tsdf_fusion,
-                          view_consistent_merge, vcm_voxel_size,
-                          wall_slab, slab_scale_duoi, slab_scale_tren,
-                          wall_collapse_source, wall_collapse_strength,
-                          wall_harmonize_parallel_planes, wall_harmonize_parallel_tol_deg, wall_harmonize_offset_tol_ratio,
-                          remove_ground,
-                          ground_y_preference,
-                          ground_coplanar_angle_tol_deg,
-                          ground_coplanar_offset_tol,
-                          remove_outlier_cc,
-                                  scenegraph_type, winsize, refid],
-                          outputs=[scene, outmodel, outmodel_facade, outgallery, out_glb_file, out_ply_file])
+            run_btn.click(
+                fn=recon_fun_safe,
+                inputs=[
+                    inputfiles,
+                    schedule,
+                    niter,
+                    min_conf_thr,
+                    as_pointcloud,
+                    mask_sky,
+                    clean_depth,
+                    transparent_cams,
+                    cam_size,
+                    save_glb,
+                    save_ply,
+                    align_ground_to_oxz_export,
+                    tsdf_fusion,
+                    view_consistent_merge,
+                    vcm_voxel_size,
+                    thin_shell_collapse,
+                    thin_shell_seed_stride,
+                    thin_shell_normal_radius_mult,
+                    thin_shell_cluster_gap_mult,
+                    thin_shell_layer_select_mode,
+                    remove_ground,
+                    ground_y_preference,
+                    ground_coplanar_angle_tol_deg,
+                    ground_coplanar_offset_tol,
+                    remove_outlier_cc,
+                    scenegraph_type,
+                    winsize,
+                    refid,
+                ],
+                outputs=[scene, outmodel, outgallery, out_glb_file, out_ply_file],
+            )
             min_conf_thr.release(fn=model_from_scene_fun,
                          inputs=export_inputs,
-                                 outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                 outputs=[outmodel, out_glb_file, out_ply_file])
             cam_size.change(fn=model_from_scene_fun,
                         inputs=export_inputs,
-                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                            outputs=[outmodel, out_glb_file, out_ply_file])
             save_glb.change(fn=model_from_scene_fun,
                             inputs=export_inputs,
-                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                            outputs=[outmodel, out_glb_file, out_ply_file])
             save_ply.change(fn=model_from_scene_fun,
                             inputs=export_inputs,
-                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                            outputs=[outmodel, out_glb_file, out_ply_file])
             align_ground_to_oxz_export.change(fn=model_from_scene_fun,
                                               inputs=export_inputs,
-                                              outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                              outputs=[outmodel, out_glb_file, out_ply_file])
             tsdf_fusion.change(fn=model_from_scene_fun,
                                inputs=export_inputs,
-                               outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                               outputs=[outmodel, out_glb_file, out_ply_file])
             view_consistent_merge.change(fn=model_from_scene_fun,
                                          inputs=export_inputs,
-                                         outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                         outputs=[outmodel, out_glb_file, out_ply_file])
             vcm_voxel_size.change(fn=model_from_scene_fun,
                                   inputs=export_inputs,
-                                  outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
-            wall_slab.change(fn=model_from_scene_fun,
-                         inputs=export_inputs,
-                         outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
-            slab_scale_duoi.release(fn=model_from_scene_fun,
-                            inputs=export_inputs,
-                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
-            slab_scale_tren.release(fn=model_from_scene_fun,
-                            inputs=export_inputs,
-                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
-            wall_collapse_source.change(fn=model_from_scene_fun,
-                        inputs=export_inputs,
-                        outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
-            wall_collapse_strength.release(fn=model_from_scene_fun,
-                           inputs=export_inputs,
-                           outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
-            wall_harmonize_parallel_planes.change(fn=model_from_scene_fun,
-                                  inputs=export_inputs,
-                                  outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
-            wall_harmonize_parallel_tol_deg.release(fn=model_from_scene_fun,
-                                    inputs=export_inputs,
-                                    outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
-            wall_harmonize_offset_tol_ratio.release(fn=model_from_scene_fun,
-                                    inputs=export_inputs,
-                                    outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                  outputs=[outmodel, out_glb_file, out_ply_file])
+            thin_shell_collapse.change(fn=model_from_scene_fun,
+                                       inputs=export_inputs,
+                                       outputs=[outmodel, out_glb_file, out_ply_file])
+            thin_shell_seed_stride.change(fn=model_from_scene_fun,
+                                          inputs=export_inputs,
+                                          outputs=[outmodel, out_glb_file, out_ply_file])
+            thin_shell_normal_radius_mult.change(fn=model_from_scene_fun,
+                                                 inputs=export_inputs,
+                                                 outputs=[outmodel, out_glb_file, out_ply_file])
+            thin_shell_cluster_gap_mult.change(fn=model_from_scene_fun,
+                                               inputs=export_inputs,
+                                               outputs=[outmodel, out_glb_file, out_ply_file])
+            thin_shell_layer_select_mode.change(fn=model_from_scene_fun,
+                                                inputs=export_inputs,
+                                                outputs=[outmodel, out_glb_file, out_ply_file])
+            # wall_slab-related events removed
             as_pointcloud.change(fn=model_from_scene_fun,
                          inputs=export_inputs,
-                                 outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                 outputs=[outmodel, out_glb_file, out_ply_file])
             mask_sky.change(fn=model_from_scene_fun,
                         inputs=export_inputs,
-                            outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                            outputs=[outmodel, out_glb_file, out_ply_file])
             clean_depth.change(fn=model_from_scene_fun,
                            inputs=export_inputs,
-                               outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                               outputs=[outmodel, out_glb_file, out_ply_file])
             transparent_cams.change(model_from_scene_fun,
                             inputs=export_inputs,
-                                    outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                    outputs=[outmodel, out_glb_file, out_ply_file])
             remove_ground.change(fn=model_from_scene_fun,
                                 inputs=export_inputs,
-                                outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                outputs=[outmodel, out_glb_file, out_ply_file])
             ground_y_preference.change(fn=model_from_scene_fun,
                                        inputs=export_inputs,
-                                       outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                       outputs=[outmodel, out_glb_file, out_ply_file])
             ground_coplanar_angle_tol_deg.release(fn=model_from_scene_fun,
                                                   inputs=export_inputs,
-                                                  outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                                  outputs=[outmodel, out_glb_file, out_ply_file])
             ground_coplanar_offset_tol.change(fn=model_from_scene_fun,
                                               inputs=export_inputs,
-                                              outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                              outputs=[outmodel, out_glb_file, out_ply_file])
             remove_outlier_cc.change(fn=model_from_scene_fun,
                                      inputs=export_inputs,
-                                     outputs=[outmodel, outmodel_facade, out_glb_file, out_ply_file])
+                                     outputs=[outmodel, out_glb_file, out_ply_file])
             # statistic_plane events are temporarily hidden.
             # statistic_plane.change(fn=model_from_scene_fun,
             #                     inputs=export_inputs,

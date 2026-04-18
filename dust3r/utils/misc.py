@@ -101,6 +101,8 @@ def transposed(dic):
 
 
 def invalid_to_nans(arr, valid_mask, ndim=999):
+    # hàm này để convert các điểm không hợp lệ thành NaN, 
+    # để không ảnh hưởng đến việc tính toán scaling
     if valid_mask is not None:
         arr = arr.clone()
         arr[~valid_mask] = float('nan')
@@ -110,6 +112,8 @@ def invalid_to_nans(arr, valid_mask, ndim=999):
 
 
 def invalid_to_zeros(arr, valid_mask, ndim=999):
+    # hàm này để convert các điểm không hợp lệ thành 0, 
+    # để không ảnh hưởng đến việc tính toán scaling
     if valid_mask is not None:
         arr = arr.clone()
         arr[~valid_mask] = 0
